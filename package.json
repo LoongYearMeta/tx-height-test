@@ -1,0 +1,28 @@
+{
+  "name": "tx-height-test",
+  "version": "1.0.0",
+  "description": "用于生成 **可复现的网状交易链（Mesh Transaction Chain）**，主要用于测试：",
+  "main": "automation-alltypes.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LoongYearMeta/tx-height-test.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/LoongYearMeta/tx-height-test/issues"
+  },
+  "homepage": "https://github.com/LoongYearMeta/tx-height-test#readme",
+  "dependencies": {
+    "axios": "^1.16.1",
+    "minimist": "^1.2.8",
+    "tbc-contract": "^1.6.0",
+    "tbc-lib-js": "^1.0.30",
+    "zeromq": "^6.0.0"
+  }
+}

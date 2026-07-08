@@ -1,0 +1,6 @@
+mesh-chain-ledger.json
+automation-alltypes-ledger.json
+automation-ftonly-ledger.json
+mesh-chain-output/
+ftonly-output/
+node_modules/

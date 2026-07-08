@@ -1,0 +1,34 @@
+{
+  "rpc": {
+    "url": "http://localhost:8332",
+    "username": "username",
+    "password": "randompasswd"
+  },
+  "coinbasePrivKey": "L1u2TmR7hMMMSV9Bx2Lyt3sujbboqEFqnKygnPRnQERhKB4qptuK",
+  "outputBaseDir": "./ftonly-output",
+  "ledgerFile": "./automation-ftonly-ledger.json",
+  "maxGenerators": 2,
+  "maxBroadcasts": 2,
+  "maxBroadcastRetries": 3,
+  "pollInterval": 10000,
+  "rpcTimeout": 30000,
+  "generatorStallTimeoutMs": 600000,
+  "rpcCooldownAfterGeneratorMs": 60000,
+  "stopCreatingNew": false,
+  "generator": {
+    "groups": 4,
+    "perGroup": 10,
+    "ftAmount": 1,
+    "decimal": 6,
+    "to": "1Nykpv2CofTzpE1knswfVtLgrHFnHavsK7",
+    "randomMinMb": 900,
+    "randomMaxMb": 1100,
+    "maxFtCount": 0,
+    "broadcast": true,
+    "broadcastBatchSize": 10,
+    "broadcastDelayMs": 250,
+    "writeLocalTxs": false,
+    "cli": "/home/nemo/TBCNODE/bin/bitcoin-cli",
+    "conf": "/home/nemo/TBCNODE/node.main.conf"
+  }
+}
