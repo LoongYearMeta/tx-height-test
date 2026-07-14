@@ -3,7 +3,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
 const readline = require('readline');
 const minimist = require('minimist');
 const axios = require('axios');
@@ -90,6 +90,9 @@ const GROUP_FILE = (i) => path.join(OUTPUT_DIR, `ft_group_${i}.txt`);
 const TX_MAP_FILE = path.join(OUTPUT_DIR, 'local_txs.json');
 const TX_MAP_JSONL_FILE = path.join(OUTPUT_DIR, 'local_txs.jsonl');
 const META_FILE = path.join(OUTPUT_DIR, 'metadata.json');
+const LAYER_FILE = (i) => path.join(OUTPUT_DIR, `ft_layer_${i}.txt`);
+const WORKER_SUFFIX = argv['worker-suffix'] ? `.${argv['worker-suffix']}` : '';
+const ACTIVE_LAYER_FILE = (i) => `${LAYER_FILE(i)}${WORKER_SUFFIX}`;
 
 const EST_TX_BYTES = 5500;
 const FEE_PER_KB = 150;
@@ -114,14 +117,21 @@ const MAX_FANOUT_OUTPUTS = 500;
 
 fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
-main().catch((e) => {
+if (argv['worker-bundle']) workerMain().catch((e) => {
+  console.error(e.stack || e.message);
+  process.exit(1);
+}); else main().catch((e) => {
   console.error(e.stack || e.message);
   process.exit(1);
 });
 
-async function main() {
-  resetOutputFiles();
+async function workerMain() {
+  const counters = { prepare: 0, group: 0, bytes: 0 };
+  const result = generateFtBundle(Number(argv['worker-index']), JSON.parse(argv['worker-utxo']), counters, Number(argv['worker-base-layer']));
+  fs.writeFileSync(argv['worker-result'], JSON.stringify({ result, counters }));
+}
 
+async function main() {
   const initialUtxo = await getInitialUtxo();
   const requestedFtCount = getRequestedFtCount();
   const cappedByUser = MAX_FT_COUNT > 0 ? Math.min(requestedFtCount, MAX_FT_COUNT) : requestedFtCount;
@@ -129,7 +139,10 @@ async function main() {
   if (fundedFtCount < 1) throw new Error(`初始 UTXO 余额不足: ${initialUtxo.satoshis} sat, 单个 FT bundle 建议至少 ${MIN_INITIAL_SAT} sat`);
 
   const ftCount = fundedFtCount;
-  const roots = ftCount === 1 ? { utxos: [initialUtxo], splitRaws: [] } : createFundingFanout(initialUtxo, ftCount);
+  const roots = ftCount === 1 ? { utxos: [initialUtxo], splitLayers: [] } : createFundingFanout(initialUtxo, ftCount);
+  const bundleBaseLayer = roots.splitLayers.length;
+  const layerCount = bundleBaseLayer + 2 + N_GROUPS + X_PER_GROUP;
+  resetOutputFiles(layerCount);
   const counters = { prepare: 0, group: 0, bytes: 0 };
 
   console.log(`地址:         ${addressA}`);
@@ -143,16 +156,12 @@ async function main() {
   if (TARGET_BYTES) console.log(`目标体积:     ${(TARGET_BYTES / 1024 / 1024).toFixed(2)} MB`);
   console.log(`输出目录:     ${OUTPUT_DIR}\n`);
 
-  for (const raw of roots.splitRaws) writeRaw(PREPARE_FILE, raw, counters, 'prepare');
-
-  const contracts = [];
-  for (let i = 0; i < ftCount; i++) {
-    const result = generateFtBundle(i, roots.utxos[i], counters);
-    contracts.push(result);
-    if ((i + 1) % 25 === 0 || i + 1 === ftCount) {
-      console.log(`生成进度: ${i + 1}/${ftCount} FT bundles, raw ${(counters.bytes / 1024 / 1024).toFixed(2)} MB`);
-    }
+  for (let layer = 0; layer < roots.splitLayers.length; layer++) {
+    for (const raw of roots.splitLayers[layer]) writeLayerRaw(layer, raw, counters, 'prepare');
   }
+
+  const contracts = await generateBundlesParallel(roots.utxos, bundleBaseLayer, counters);
+  await mergeWorkerLayers(layerCount);
 
   fs.writeFileSync(META_FILE, JSON.stringify({
     addressA,
@@ -169,6 +178,9 @@ async function main() {
     estimatedBundleBytes: BUNDLE_EST_BYTES,
     estimatedTotalBytes: BUNDLE_EST_BYTES * ftCount + fanoutBytes(ftCount),
     actualRawBytes: counters.bytes,
+    completionReason: TARGET_BYTES && counters.bytes >= TARGET_BYTES
+      ? 'target-size-reached'
+      : (MAX_FT_COUNT > 0 && ftCount >= MAX_FT_COUNT ? 'user-cap-reached' : 'funds-exhausted'),
     contracts,
     groups: N_GROUPS,
     perGroup: X_PER_GROUP,
@@ -176,28 +188,68 @@ async function main() {
     prepareFtAmount: PREPARE_FT_AMOUNT,
     feePerGroupSat: FEE_PER_GROUP_SAT,
     files: {
-      prepare: PREPARE_FILE,
-      groups: Array.from({ length: N_GROUPS }, (_, i) => GROUP_FILE(i)),
+      layers: Array.from({ length: layerCount }, (_, i) => LAYER_FILE(i)),
+      prepare: null,
+      groups: [],
       localTxs: argv['write-local-txs'] ? TX_MAP_JSONL_FILE : null,
     },
   }, null, 2));
 
-  console.log(`prepare txs:  ${counters.prepare} -> ${PREPARE_FILE}`);
+  console.log(`prepare txs:  ${counters.prepare}`);
   console.log(`group txs:    ${counters.group}`);
+  console.log(`依赖层数:     ${layerCount}`);
   console.log(`raw size:     ${(counters.bytes / 1024 / 1024).toFixed(2)} MB`);
 
   if (argv.broadcast) {
-    console.log('\n开始广播 prepare...');
-    await broadcastFile(PREPARE_FILE);
-    for (let i = 0; i < N_GROUPS; i++) {
-      console.log(`开始广播 group ${i}...`);
-      await broadcastFile(GROUP_FILE(i));
+    for (let i = 0; i < layerCount; i++) {
+      console.log(`开始广播 layer ${i}/${layerCount - 1}...`);
+      await broadcastFile(LAYER_FILE(i));
     }
     console.log('广播完成');
   }
 }
 
-function generateFtBundle(index, initialUtxo, counters) {
+async function generateBundlesParallel(utxos, baseLayer, counters) {
+  const workerCount = Math.max(1, Number(argv['construction-workers']) || 1);
+  if (workerCount === 1 || utxos.length < 2) {
+    const out = [];
+    for (let i = 0; i < utxos.length; i++) out.push(generateFtBundle(i, utxos[i], counters, baseLayer));
+    return out;
+  }
+  const out = new Array(utxos.length);
+  let next = 0;
+  async function worker(slot) {
+    while (next < utxos.length) {
+      const i = next++;
+      const resultFile = path.join(OUTPUT_DIR, `.worker_${slot}_${i}.json`);
+      const args = ['--worker-bundle', '--worker-index', String(i), '--worker-base-layer', String(baseLayer), '--worker-suffix', `${slot}_${i}`, '--worker-utxo', JSON.stringify(utxos[i]), '--worker-result', resultFile, '--privkey', privateKey.toString(), '--groups', String(N_GROUPS), '--per-group', String(X_PER_GROUP), '--ft-amount', String(FT_AMOUNT), '--decimal', String(DECIMAL), '--name', argv.name, '--symbol', argv.symbol, '--to', addressB, '--outputdir', OUTPUT_DIR];
+      const child = spawn(process.execPath, [__filename, ...args], { stdio: ['ignore', 'ignore', 'inherit'] });
+      await new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', code => code === 0 ? resolve() : reject(new Error(`worker ${i} exit=${code}`))); });
+      const data = JSON.parse(fs.readFileSync(resultFile, 'utf8')); fs.unlinkSync(resultFile);
+      out[i] = data.result; counters.prepare += data.counters.prepare; counters.group += data.counters.group; counters.bytes += data.counters.bytes;
+      if ((i + 1) % 25 === 0 || i + 1 === utxos.length) console.log(`生成进度: ${i + 1}/${utxos.length} FT bundles, raw ${(counters.bytes / 1024 / 1024).toFixed(2)} MB`);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(workerCount, utxos.length) }, (_, i) => worker(i)));
+  return out;
+}
+
+async function mergeWorkerLayers(layerCount) {
+  for (let layer = 0; layer < layerCount; layer++) {
+    const shards = fs.readdirSync(OUTPUT_DIR).filter(n => n.startsWith(`ft_layer_${layer}.txt.`));
+    for (const shard of shards) {
+      await new Promise((resolve, reject) => {
+        const input = fs.createReadStream(path.join(OUTPUT_DIR, shard));
+        const output = fs.createWriteStream(LAYER_FILE(layer), { flags: 'a' });
+        input.on('error', reject); output.on('error', reject); output.on('finish', resolve);
+        input.pipe(output);
+      });
+    }
+    for (const shard of shards) fs.unlinkSync(path.join(OUTPUT_DIR, shard));
+  }
+}
+
+function generateFtBundle(index, initialUtxo, counters, baseLayer) {
   const localTxMap = new Map();
   const suffix = index === 0 ? '' : String(index);
   const ft = new FT({
@@ -210,8 +262,8 @@ function generateFtBundle(index, initialUtxo, counters) {
   const mintRaws = ft.MintFT(privateKey, addressA, initialUtxo);
   const txSource = rememberRaw(mintRaws[0], localTxMap);
   const txMint = rememberRaw(mintRaws[1], localTxMap);
-  writeRaw(PREPARE_FILE, mintRaws[0], counters, 'prepare', txSource.hash);
-  writeRaw(PREPARE_FILE, mintRaws[1], counters, 'prepare', txMint.hash);
+  writeLayerRaw(baseLayer, mintRaws[0], counters, 'prepare', txSource.hash);
+  writeLayerRaw(baseLayer + 1, mintRaws[1], counters, 'prepare', txMint.hash);
 
   let currentFt = {
     utxo: buildUTXO(txMint, 0, true),
@@ -235,7 +287,7 @@ function generateFtBundle(index, initialUtxo, counters) {
       satToTbc(FEE_PER_GROUP_SAT)
     );
     const tx = rememberRaw(raw, localTxMap);
-    writeRaw(PREPARE_FILE, raw, counters, 'prepare', tx.hash);
+    writeLayerRaw(baseLayer + 2 + i, raw, counters, 'prepare', tx.hash);
 
     groupStates.push({
       ft: {
@@ -274,7 +326,8 @@ function generateFtBundle(index, initialUtxo, counters) {
         [prepre]
       );
       const tx = rememberRaw(raw, localTxMap);
-      writeRaw(GROUP_FILE(g), raw, counters, 'group', tx.hash);
+      // 所有 prepare 层完成后，按 transfer 深度轮转全部独立 bundle/group。
+      writeLayerRaw(baseLayer + 2 + N_GROUPS + j, raw, counters, 'group', tx.hash);
 
       state = {
         utxo: buildUTXO(tx, 2, true),
@@ -340,7 +393,7 @@ function createFundingFanout(initialUtxo, count) {
   if (count <= MAX_FANOUT_OUTPUTS) {
     const tx = splitUtxo(initialUtxo, Array.from({ length: count }, () => MIN_INITIAL_SAT));
     return {
-      splitRaws: [tx.uncheckedSerialize()],
+      splitLayers: [[tx.uncheckedSerialize()]],
       utxos: Array.from({ length: count }, (_, i) => p2pkhUtxo(tx, i)),
     };
   }
@@ -352,17 +405,17 @@ function createFundingFanout(initialUtxo, count) {
 
   const chunkAmounts = chunkSizes.map((size) => size * MIN_INITIAL_SAT + splitFeeSat(size));
   const topTx = splitUtxo(initialUtxo, chunkAmounts);
-  const splitRaws = [topTx.uncheckedSerialize()];
+  const splitLayers = [[topTx.uncheckedSerialize()], []];
   const utxos = [];
 
   for (let i = 0; i < chunkSizes.length; i++) {
     const chunkInput = p2pkhUtxo(topTx, i);
     const chunkTx = splitUtxo(chunkInput, Array.from({ length: chunkSizes[i] }, () => MIN_INITIAL_SAT));
-    splitRaws.push(chunkTx.uncheckedSerialize());
+    splitLayers[1].push(chunkTx.uncheckedSerialize());
     for (let j = 0; j < chunkSizes[i]; j++) utxos.push(p2pkhUtxo(chunkTx, j));
   }
 
-  return { splitRaws, utxos };
+  return { splitLayers, utxos };
 }
 
 function splitUtxo(input, amounts) {
@@ -453,10 +506,16 @@ function createRng(seedText) {
   };
 }
 
-function resetOutputFiles() {
-  fs.writeFileSync(PREPARE_FILE, '');
-  for (let i = 0; i < N_GROUPS; i++) fs.writeFileSync(GROUP_FILE(i), '');
+function resetOutputFiles(layerCount) {
+  for (const name of fs.readdirSync(OUTPUT_DIR)) {
+    if (/^ft_layer_\d+\.txt(?:\..+)?$/.test(name)) fs.unlinkSync(path.join(OUTPUT_DIR, name));
+  }
+  for (let i = 0; i < layerCount; i++) fs.writeFileSync(LAYER_FILE(i), '');
   if (argv['write-local-txs']) fs.writeFileSync(TX_MAP_JSONL_FILE, '');
+}
+
+function writeLayerRaw(layer, raw, counters, kind, txId) {
+  writeRaw(ACTIVE_LAYER_FILE(layer), raw, counters, kind, txId);
 }
 
 function writeRaw(file, raw, counters, kind, txId) {
