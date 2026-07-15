@@ -76,6 +76,7 @@ const DEFAULTS = {
   maxBroadcastRetries: 3,
   pollInterval: 10000,
   rpcTimeout: 30000,
+  shutdownTimeoutMs: 45000,
   generatorStallTimeoutMs: 10 * 60 * 1000,
   rpcCooldownAfterGeneratorMs: 60 * 1000,
   resourceLimits: {
@@ -102,6 +103,8 @@ const activeBroadcasts = new Map();
 let ledger = loadLedger();
 let lastHeight = 0;
 let loopRunning = false;
+let shuttingDown = false;
+let shutdownPromise = null;
 let rpcGateClosedUntil = 0;
 let rpcGateReason = '';
 let resourceState = {
@@ -115,10 +118,13 @@ let lastResourceMessage = '';
 recoverStale(ledger);
 
 runLoopOnce();
-setInterval(runLoopOnce, CONFIG.pollInterval);
+const loopTimer = setInterval(runLoopOnce, CONFIG.pollInterval);
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => requestShutdown(signal));
+}
 
 async function runLoopOnce() {
-  if (loopRunning) return;
+  if (loopRunning || shuttingDown) return;
   loopRunning = true;
   try {
     await mainLoop();
@@ -130,6 +136,7 @@ async function runLoopOnce() {
 }
 
 async function mainLoop() {
+  if (shuttingDown) return;
   checkGeneratorWatchdogs();
   if (isRpcGateClosed()) {
     printStats();
@@ -144,6 +151,7 @@ async function mainLoop() {
 
   const height = await rpc('getblockcount', [], CONFIG.rpcTimeout);
   await refreshResourceState();
+  if (shuttingDown) return;
   if (lastHeight === 0) {
     const ledgerMaxHeight = getLedgerMaxHeight(ledger);
     lastHeight = ledgerMaxHeight > 0 ? ledgerMaxHeight : height;
@@ -261,6 +269,7 @@ async function extractCoinbaseUTXO(block) {
 }
 
 function drainPending() {
+  if (shuttingDown) return;
   if (isRpcGateClosed()) return;
   if (!resourceState.generationAllowed) return;
   while (activeGenerators.size < CONFIG.maxGenerators) {
@@ -273,7 +282,7 @@ function drainPending() {
 function startGenerator(entry) {
   fs.mkdirSync(entry.outputDir, { recursive: true });
   const logFd = fs.openSync(path.join(entry.outputDir, 'automation-ftonly.log'), 'a');
-  const seed = `${entry.id}-${Date.now()}`;
+  const seed = entry.seed || `${entry.id}-${Date.now()}`;
   const g = CONFIG.generator;
 
   const args = [
@@ -319,7 +328,15 @@ function startGenerator(entry) {
   child.on('exit', (code, signal) => {
     safeClose(logFd);
     activeGenerators.delete(entry.id);
-    if (code === 0) {
+    if (shuttingDown) {
+      console.log(`[退出保存] ${entry.id}: generating -> pending`);
+      updateEntry(entry.id, 'pending', {
+        generatorPid: null,
+        generatorFinishedAt: new Date().toISOString(),
+        interruptedAt: new Date().toISOString(),
+        error: null,
+      });
+    } else if (code === 0) {
       const nextStatus = CONFIG.generator.broadcast ? 'generated' : 'completed';
       console.log(CONFIG.generator.broadcast ? `[生成完成] ${entry.id}` : `[完成] ${entry.id}`);
       updateEntry(entry.id, nextStatus, {
@@ -335,22 +352,32 @@ function startGenerator(entry) {
         error: signal ? `generator killed by signal=${signal}` : `generator exit code=${code}`,
       });
     }
-    drainPending();
+    if (!shuttingDown) drainPending();
   });
 
   child.on('error', (err) => {
     safeClose(logFd);
     activeGenerators.delete(entry.id);
-    closeRpcGate(CONFIG.rpcCooldownAfterGeneratorMs, `generator error: ${entry.id}`);
-    updateEntry(entry.id, 'failed', {
-      generatorFinishedAt: new Date().toISOString(),
-      error: err.message,
-    });
-    drainPending();
+    if (shuttingDown) {
+      updateEntry(entry.id, 'pending', {
+        generatorPid: null,
+        generatorFinishedAt: new Date().toISOString(),
+        interruptedAt: new Date().toISOString(),
+        error: null,
+      });
+    } else {
+      closeRpcGate(CONFIG.rpcCooldownAfterGeneratorMs, `generator error: ${entry.id}`);
+      updateEntry(entry.id, 'failed', {
+        generatorFinishedAt: new Date().toISOString(),
+        error: err.message,
+      });
+      drainPending();
+    }
   });
 }
 
 function drainReadyBroadcasts() {
+  if (shuttingDown) return;
   if (!CONFIG.generator.broadcast) return;
   if (isRpcGateClosed()) return;
   if (!resourceState.broadcastAllowed) return;
@@ -369,8 +396,9 @@ function startBroadcast(entry) {
   });
 
   const logFile = path.join(entry.outputDir, 'broadcast.log');
-  activeBroadcasts.set(entry.id, { logFile });
-  runBroadcast(entry, logFile).catch((err) => {
+  const active = { logFile, promise: null };
+  activeBroadcasts.set(entry.id, active);
+  active.promise = runBroadcast(entry, logFile).catch((err) => {
     console.error(`[广播异常] ${entry.id}: ${err.message}`);
   });
 }
@@ -402,6 +430,16 @@ async function runBroadcast(entry, logFile) {
       error: null,
     });
   } catch (err) {
+    if (isShutdownRequested(err)) {
+      console.log(`[退出保存] ${entry.id}: broadcasting -> generated`);
+      appendBroadcastLog(logFile, `[paused] ${new Date().toISOString()} graceful shutdown`);
+      updateEntry(entry.id, 'generated', {
+        broadcastFinishedAt: new Date().toISOString(),
+        interruptedAt: new Date().toISOString(),
+        error: null,
+      });
+      return;
+    }
     const cur = ledger.entries.find((e) => e.id === entry.id);
     const retries = (cur?.broadcastRetries || 0) + 1;
     const giveUp = retries >= CONFIG.maxBroadcastRetries;
@@ -414,9 +452,11 @@ async function runBroadcast(entry, logFile) {
     });
   } finally {
     activeBroadcasts.delete(entry.id);
-    if (!success) closeRpcGate(CONFIG.rpcCooldownAfterGeneratorMs, `broadcast failed: ${entry.id}`);
-    drainReadyBroadcasts();
-    drainPending();
+    if (!success && !shuttingDown) closeRpcGate(CONFIG.rpcCooldownAfterGeneratorMs, `broadcast failed: ${entry.id}`);
+    if (!shuttingDown) {
+      drainReadyBroadcasts();
+      drainPending();
+    }
   }
 }
 
@@ -483,6 +523,7 @@ async function broadcastFile(entry, file, logFile) {
   const startLine = Number(saved.nextLine) || 0;
 
   for await (const line of rl) {
+    throwIfShutdownRequested();
     const raw = line.trim();
     if (!raw) continue;
     if (seen++ < startLine) continue;
@@ -492,6 +533,7 @@ async function broadcastFile(entry, file, logFile) {
         await broadcastBatch(batch, logFile);
         sent += batch.length;
         saveFileProgress(entry, file, startLine + sent);
+        throwIfShutdownRequested();
         batch = [];
         await delay(delayMs);
       }
@@ -499,6 +541,7 @@ async function broadcastFile(entry, file, logFile) {
       await sendRawAllowAlready(raw);
       sent++;
       saveFileProgress(entry, file, startLine + sent);
+      throwIfShutdownRequested();
       await delay(delayMs);
     }
     if (sent >= nextProgressLog) {
@@ -509,9 +552,11 @@ async function broadcastFile(entry, file, logFile) {
   }
 
   if (batch.length > 0) {
+    throwIfShutdownRequested();
     await broadcastBatch(batch, logFile);
     sent += batch.length;
     saveFileProgress(entry, file, startLine + sent);
+    throwIfShutdownRequested();
     await delay(delayMs);
   }
   saveFileProgress(entry, file, startLine + sent, true);
@@ -626,6 +671,77 @@ function isAlreadyAcceptedError(err) {
 function delay(ms) {
   if (!ms) return Promise.resolve();
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+class ShutdownRequestedError extends Error {
+  constructor() {
+    super('graceful shutdown requested');
+    this.name = 'ShutdownRequestedError';
+  }
+}
+
+function throwIfShutdownRequested() {
+  if (shuttingDown) throw new ShutdownRequestedError();
+}
+
+function isShutdownRequested(err) {
+  return err instanceof ShutdownRequestedError;
+}
+
+function requestShutdown(signal) {
+  if (shutdownPromise) {
+    console.error(`[退出] 再次收到 ${signal}，立即退出`);
+    process.exit(1);
+  }
+  shutdownPromise = gracefulShutdown(signal).catch((err) => {
+    console.error(`[退出失败] ${err.stack || err.message}`);
+    process.exit(1);
+  });
+}
+
+async function gracefulShutdown(signal) {
+  shuttingDown = true;
+  clearInterval(loopTimer);
+  console.log(`\n[退出] 收到 ${signal}，停止派发新任务；保存广播游标并终止构造进程`);
+
+  const generatorWaits = [];
+  for (const active of activeGenerators.values()) {
+    generatorWaits.push(new Promise((resolve) => active.process.once('exit', resolve)));
+    try { active.process.kill('SIGTERM'); } catch (_) {}
+  }
+  const broadcastWaits = Array.from(activeBroadcasts.values())
+    .map((active) => active.promise)
+    .filter(Boolean);
+
+  let timedOut = false;
+  await Promise.race([
+    Promise.allSettled([...generatorWaits, ...broadcastWaits]),
+    delay(Math.max(1000, Number(CONFIG.shutdownTimeoutMs) || 45000)).then(() => { timedOut = true; }),
+  ]);
+
+  if (timedOut) {
+    console.error(`[退出] 等待超过 ${CONFIG.shutdownTimeoutMs}ms，强制收敛剩余任务状态`);
+    for (const [id, active] of activeGenerators.entries()) {
+      try { active.process.kill('SIGKILL'); } catch (_) {}
+      updateEntry(id, 'pending', {
+        generatorPid: null,
+        generatorFinishedAt: new Date().toISOString(),
+        interruptedAt: new Date().toISOString(),
+        error: null,
+      });
+    }
+    for (const id of activeBroadcasts.keys()) {
+      updateEntry(id, 'generated', {
+        broadcastFinishedAt: new Date().toISOString(),
+        interruptedAt: new Date().toISOString(),
+        error: null,
+      });
+    }
+  }
+
+  saveLedger();
+  console.log(`[退出完成] generators=${activeGenerators.size} broadcasts=${activeBroadcasts.size}`);
+  process.exit(0);
 }
 
 function appendBroadcastLog(file, message) {
@@ -819,10 +935,12 @@ function recoverStale(ledgerObj) {
   let changed = false;
   for (const e of ledgerObj.entries) {
     if (e.status === 'generating') {
-      e.status = 'failed';
-      e.error = 'recovery: generator died on restart';
+      e.status = 'pending';
+      e.generatorPid = null;
+      e.interruptedAt = new Date().toISOString();
+      e.error = null;
       changed = true;
-      console.log(`[恢复] ${e.id}: generating -> failed`);
+      console.log(`[恢复] ${e.id}: generating -> pending（使用原 seed 重新构造）`);
     } else if (e.status === 'broadcasting') {
       e.status = 'generated';
       e.error = 'recovery: broadcast died on restart';

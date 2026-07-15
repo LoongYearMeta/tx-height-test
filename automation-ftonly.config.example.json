@@ -12,6 +12,7 @@
   "maxBroadcastRetries": 3,
   "pollInterval": 10000,
   "rpcTimeout": 30000,
+  "shutdownTimeoutMs": 45000,
   "generatorStallTimeoutMs": 600000,
   "rpcCooldownAfterGeneratorMs": 60000,
   "resourceLimits": {
