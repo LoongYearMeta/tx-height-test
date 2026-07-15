@@ -67,7 +67,7 @@ const DEFAULTS = {
   },
 
   maxGenerators: 2,
-  maxBroadcasts: 2,
+  maxBroadcasts: 1,
   maxBroadcastRetries: 3,
   pollInterval: 10000,
   rpcTimeout: 30000,
@@ -317,23 +317,9 @@ function startGenerator(entry) {
 function drainReadyBroadcasts() {
   if (!CONFIG.generator.broadcast) return;
   while (activeBroadcasts.size < CONFIG.maxBroadcasts) {
-    // 新格式按依赖层广播，能利用同层并行；优先让它占用空闲广播槽位。
-    // 旧格式任务仍保留，在没有新格式任务或有剩余槽位时继续推进。
-    const candidates = ledger.entries
-      .filter((e) => e.status === 'generated' && broadcastFilesReady(e))
-      .sort((a, b) => broadcastPriority(b) - broadcastPriority(a) || String(a.createdAt).localeCompare(String(b.createdAt)));
-    const entry = candidates[0];
+    const entry = ledger.entries.find((e) => e.status === 'generated' && broadcastFilesReady(e));
     if (!entry) return;
     startBroadcast(entry);
-  }
-}
-
-function broadcastPriority(entry) {
-  try {
-    const meta = JSON.parse(fs.readFileSync(path.join(entry.outputDir, 'metadata.json'), 'utf8'));
-    return Array.isArray(meta.files?.layers) && meta.files.layers.length > 0 ? 10 : 0;
-  } catch (_) {
-    return 0;
   }
 }
 
@@ -354,7 +340,7 @@ function startBroadcast(entry) {
 async function runBroadcast(entry, logFile) {
   let success = false;
   try {
-    appendBroadcastLog(logFile, `[start] ${new Date().toISOString()} id=${entry.id} format=${broadcastPriority(entry) > 0 ? 'layered' : 'legacy'} pid=${process.pid} rpc=${CONFIG.rpc.url}`);
+    appendBroadcastLog(logFile, `[start] ${new Date().toISOString()} id=${entry.id} pid=${process.pid} rpc=${CONFIG.rpc.url}`);
     for (const file of getBroadcastFiles(entry)) {
       appendBroadcastLog(logFile, `[file] ${path.basename(file)}`);
       await broadcastFile(file, logFile);
