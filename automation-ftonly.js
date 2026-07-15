@@ -33,6 +33,7 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 const minimist = require('minimist');
+const Transaction = require('tbc-lib-js/lib/transaction/transaction');
 
 const argv = minimist(process.argv.slice(2), { string: ['config'] });
 
@@ -379,7 +380,7 @@ async function runBroadcast(entry, logFile) {
     const files = getBroadcastFiles(entry);
     const prepare = files[0];
     appendBroadcastLog(logFile, `[file] ${path.basename(prepare)}`);
-    await broadcastFile(entry, prepare, logFile);
+    await broadcastDependencyOrderedFile(entry, prepare, logFile);
 
     // prepare 建立所有 group 的依赖根；完成后 group 之间完全独立，可以并行广播。
     const groups = files.slice(1);
@@ -387,7 +388,7 @@ async function runBroadcast(entry, logFile) {
     for (let offset = 0; offset < groups.length; offset += concurrency) {
       const results = await Promise.allSettled(groups.slice(offset, offset + concurrency).map(async (file) => {
         appendBroadcastLog(logFile, `[file] ${path.basename(file)}`);
-        await broadcastFile(entry, file, logFile);
+        await broadcastDependencyOrderedFile(entry, file, logFile);
       }));
       const failed = results.find((result) => result.status === 'rejected');
       if (failed) throw failed.reason;
@@ -447,7 +448,8 @@ function ensureBroadcastProgress(entry) {
 
 function fileProgress(entry, file) {
   const progress = ensureBroadcastProgress(entry);
-  const name = path.basename(file);
+  const relative = path.relative(path.resolve(entry.outputDir), path.resolve(file));
+  const name = relative.startsWith('..') ? path.basename(file) : relative;
   if (!progress.files[name]) progress.files[name] = { nextLine: 0, done: false };
   return progress.files[name];
 }
@@ -458,6 +460,89 @@ function saveFileProgress(entry, file, nextLine, done = false) {
   progress.done = done;
   progress.updatedAt = new Date().toISOString();
   saveLedger();
+}
+
+async function broadcastDependencyOrderedFile(entry, file, logFile) {
+  const logicalProgress = fileProgress(entry, file);
+  if (logicalProgress.done) {
+    appendBroadcastLog(logFile, `  ${path.basename(file)} resume-skip done=${logicalProgress.nextLine}`);
+    return;
+  }
+
+  const schedule = await getDependencySchedule(entry, file, logFile);
+  let total = 0;
+  for (let layer = 0; layer < schedule.layers.length; layer++) {
+    const layerFile = schedule.layers[layer];
+    appendBroadcastLog(logFile, `  ${path.basename(file)} dependency-layer=${layer}/${schedule.layers.length - 1} txs=${schedule.counts[layer]}`);
+    await broadcastFile(entry, layerFile, logFile);
+    total += schedule.counts[layer];
+  }
+  saveFileProgress(entry, file, total, true);
+  appendBroadcastLog(logFile, `  ${path.basename(file)} dependency-done=${total} layers=${schedule.layers.length}`);
+}
+
+async function getDependencySchedule(entry, file, logFile) {
+  const stat = fs.statSync(file);
+  const scheduleDir = path.join(entry.outputDir, '.broadcast-layers', path.basename(file));
+  const manifestFile = path.join(scheduleDir, 'manifest.json');
+  try {
+    const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+    if (manifest.version === 1 && manifest.sourceSize === stat.size && manifest.sourceMtimeMs === stat.mtimeMs &&
+        Array.isArray(manifest.layers) && manifest.layers.every((name) => fs.existsSync(path.join(scheduleDir, name)))) {
+      return {
+        layers: manifest.layers.map((name) => path.join(scheduleDir, name)),
+        counts: manifest.counts,
+      };
+    }
+  } catch (_) {}
+
+  fs.mkdirSync(scheduleDir, { recursive: true });
+  for (const name of fs.readdirSync(scheduleDir)) {
+    if (/^layer-\d+\.txt$/.test(name) || name === 'manifest.json') {
+      try { fs.unlinkSync(path.join(scheduleDir, name)); } catch (_) {}
+    }
+  }
+
+  const depths = new Map();
+  const counts = [];
+  const fds = [];
+  const rl = readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
+  try {
+    for await (const line of rl) {
+      const raw = line.trim();
+      if (!raw) continue;
+      const tx = new Transaction(raw);
+      let depth = 0;
+      for (const input of tx.inputs) {
+        const parentDepth = depths.get(input.prevTxId.toString('hex'));
+        if (parentDepth !== undefined) depth = Math.max(depth, parentDepth + 1);
+      }
+      depths.set(tx.hash, depth);
+      if (fds[depth] === undefined) {
+        fds[depth] = fs.openSync(path.join(scheduleDir, `layer-${depth}.txt`), 'a');
+        counts[depth] = 0;
+      }
+      fs.writeSync(fds[depth], raw + '\n');
+      counts[depth]++;
+    }
+  } finally {
+    for (const fd of fds) safeClose(fd);
+  }
+
+  const layers = counts.map((_, depth) => `layer-${depth}.txt`);
+  const manifest = {
+    version: 1,
+    source: path.basename(file),
+    sourceSize: stat.size,
+    sourceMtimeMs: stat.mtimeMs,
+    layers,
+    counts,
+    total: counts.reduce((sum, count) => sum + count, 0),
+    createdAt: new Date().toISOString(),
+  };
+  fs.writeFileSync(manifestFile, JSON.stringify(manifest, null, 2));
+  appendBroadcastLog(logFile, `  ${path.basename(file)} dependency-index layers=${layers.length} txs=${manifest.total}`);
+  return { layers: layers.map((name) => path.join(scheduleDir, name)), counts };
 }
 
 async function broadcastFile(entry, file, logFile) {
