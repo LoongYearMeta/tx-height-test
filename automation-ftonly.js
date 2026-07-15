@@ -57,8 +57,10 @@ const DEFAULTS = {
     randomMaxMb: 1100,
     maxFtCount: 0,
     broadcast: true,
-    broadcastBatchSize: 10,
-    broadcastDelayMs: 250,
+    // sendrawtransactions 会在节点内并行验证批次；prepare 完成后各 group 也并行推进。
+    broadcastBatchSize: 250,
+    broadcastDelayMs: 0,
+    broadcastGroupConcurrency: 4,
     writeLocalTxs: false,
     cli: '/home/nemo/TBCNODE/bin/bitcoin-cli',
     conf: '/home/nemo/TBCNODE/node.main.conf',
@@ -182,18 +184,29 @@ function closeRpcGate(ms, reason) {
 }
 
 async function rpc(method, params = [], timeout = 30000) {
-  const res = await axios.post(CONFIG.rpc.url, {
-    jsonrpc: '1.0',
-    id: 'ftonly-auto',
-    method,
-    params,
-  }, {
-    auth: {
-      username: CONFIG.rpc.username,
-      password: CONFIG.rpc.password,
-    },
-    timeout,
-  });
+  let res;
+  try {
+    res = await axios.post(CONFIG.rpc.url, {
+      jsonrpc: '1.0',
+      id: 'ftonly-auto',
+      method,
+      params,
+    }, {
+      auth: {
+        username: CONFIG.rpc.username,
+        password: CONFIG.rpc.password,
+      },
+      timeout,
+    });
+  } catch (err) {
+    const rpcError = err.response?.data?.error;
+    if (rpcError) {
+      err.rpcCode = rpcError.code;
+      err.rpcMessage = rpcError.message;
+      err.message = `RPC ${method} code=${rpcError.code}: ${rpcError.message}`;
+    }
+    throw err;
+  }
   if (res.data.error) throw new Error(JSON.stringify(res.data.error));
   return res.data.result;
 }
@@ -275,6 +288,7 @@ function startGenerator(entry) {
     generatorPid: child.pid,
     generatorStartedAt: new Date().toISOString(),
     seed,
+    broadcastProgress: null,
   });
 
   child.on('exit', (code, signal) => {
@@ -313,6 +327,7 @@ function startGenerator(entry) {
 
 function drainReadyBroadcasts() {
   if (!CONFIG.generator.broadcast) return;
+  if (isRpcGateClosed()) return;
   while (activeBroadcasts.size < CONFIG.maxBroadcasts) {
     const entry = ledger.entries.find((e) => e.status === 'generated' && broadcastFilesReady(e));
     if (!entry) return;
@@ -338,9 +353,21 @@ async function runBroadcast(entry, logFile) {
   let success = false;
   try {
     appendBroadcastLog(logFile, `[start] ${new Date().toISOString()} id=${entry.id} pid=${process.pid} rpc=${CONFIG.rpc.url}`);
-    for (const file of getBroadcastFiles(entry)) {
-      appendBroadcastLog(logFile, `[file] ${path.basename(file)}`);
-      await broadcastFile(file, logFile);
+    const files = getBroadcastFiles(entry);
+    const prepare = files[0];
+    appendBroadcastLog(logFile, `[file] ${path.basename(prepare)}`);
+    await broadcastFile(entry, prepare, logFile);
+
+    // prepare 建立所有 group 的依赖根；完成后 group 之间完全独立，可以并行广播。
+    const groups = files.slice(1);
+    const concurrency = Math.max(1, Number(CONFIG.generator.broadcastGroupConcurrency) || groups.length || 1);
+    for (let offset = 0; offset < groups.length; offset += concurrency) {
+      const results = await Promise.allSettled(groups.slice(offset, offset + concurrency).map(async (file) => {
+        appendBroadcastLog(logFile, `[file] ${path.basename(file)}`);
+        await broadcastFile(entry, file, logFile);
+      }));
+      const failed = results.find((result) => result.status === 'rejected');
+      if (failed) throw failed.reason;
     }
     success = true;
     console.log(`[广播完成] ${entry.id}`);
@@ -387,45 +414,82 @@ function getBroadcastFiles(entry) {
   return files;
 }
 
-async function broadcastFile(file, logFile) {
+function ensureBroadcastProgress(entry) {
+  if (!entry.broadcastProgress || entry.broadcastProgress.version !== 1) {
+    entry.broadcastProgress = { version: 1, files: {} };
+    saveLedger();
+  }
+  return entry.broadcastProgress;
+}
+
+function fileProgress(entry, file) {
+  const progress = ensureBroadcastProgress(entry);
+  const name = path.basename(file);
+  if (!progress.files[name]) progress.files[name] = { nextLine: 0, done: false };
+  return progress.files[name];
+}
+
+function saveFileProgress(entry, file, nextLine, done = false) {
+  const progress = fileProgress(entry, file);
+  progress.nextLine = nextLine;
+  progress.done = done;
+  progress.updatedAt = new Date().toISOString();
+  saveLedger();
+}
+
+async function broadcastFile(entry, file, logFile) {
+  const saved = fileProgress(entry, file);
+  if (saved.done) {
+    appendBroadcastLog(logFile, `  ${path.basename(file)} resume-skip done=${saved.nextLine}`);
+    return;
+  }
   const rl = readline.createInterface({
     input: fs.createReadStream(file),
     crlfDelay: Infinity,
   });
 
-  const batchSize = CONFIG.generator.broadcastBatchSize;
+  const batchSize = Math.max(1, Number(CONFIG.generator.broadcastBatchSize) || 1);
   const delayMs = CONFIG.generator.broadcastDelayMs;
   let batch = [];
   let sent = 0;
+  let seen = 0;
+  let nextProgressLog = 1000;
+  const startLine = Number(saved.nextLine) || 0;
 
   for await (const line of rl) {
     const raw = line.trim();
     if (!raw) continue;
+    if (seen++ < startLine) continue;
     if (batchSize > 1) {
       batch.push(raw);
       if (batch.length >= batchSize) {
         await broadcastBatch(batch, logFile);
         sent += batch.length;
+        saveFileProgress(entry, file, startLine + sent);
         batch = [];
         await delay(delayMs);
       }
     } else {
       await sendRawAllowAlready(raw);
       sent++;
+      saveFileProgress(entry, file, startLine + sent);
       await delay(delayMs);
     }
-    if (sent > 0 && sent % 1000 === 0) {
+    if (sent >= nextProgressLog) {
       const mp = await getMempoolSummary();
       appendBroadcastLog(logFile, `  ${path.basename(file)} sent=${sent}${mp ? ` mempool=${mp}` : ''}`);
+      nextProgressLog = (Math.floor(sent / 1000) + 1) * 1000;
     }
   }
 
   if (batch.length > 0) {
     await broadcastBatch(batch, logFile);
     sent += batch.length;
+    saveFileProgress(entry, file, startLine + sent);
     await delay(delayMs);
   }
-  appendBroadcastLog(logFile, `  ${path.basename(file)} done=${sent}`);
+  saveFileProgress(entry, file, startLine + sent, true);
+  appendBroadcastLog(logFile, `  ${path.basename(file)} done=${startLine + sent}`);
 }
 
 async function broadcastBatch(batch, logFile) {
@@ -447,8 +511,10 @@ async function broadcastBatch(batch, logFile) {
       throw new Error(`sendrawtransactions rejected ${summary.rejected}/${summary.total}: ${summary.firstError || 'unknown'}`);
     }
   } catch (err) {
-    appendBroadcastLog(logFile, `  batch=${batch.length} fallback-single: ${err.message}`);
-    for (const raw of batch) await sendRawAllowAlready(raw);
+    // 批量 RPC 已经可用时，失败后逐笔回退只会放大 RPC 压力，并重复验证已接受交易。
+    // 整批保持在同一游标上；下次重试时节点会把其中已接受的交易报告为 known。
+    appendBroadcastLog(logFile, `  batch=${batch.length} failed: ${err.message}`);
+    throw err;
   }
 }
 
@@ -587,7 +653,9 @@ function loadLedger() {
 }
 
 function saveLedger() {
-  fs.writeFileSync(CONFIG.ledgerFile, JSON.stringify(ledger, null, 2));
+  const tmp = `${CONFIG.ledgerFile}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(ledger, null, 2));
+  fs.renameSync(tmp, CONFIG.ledgerFile);
 }
 
 function addEntry(ledgerObj, height, utxo) {
@@ -604,6 +672,7 @@ function addEntry(ledgerObj, height, utxo) {
     broadcastStartedAt: null,
     broadcastFinishedAt: null,
     broadcastRetries: 0,
+    broadcastProgress: null,
     seed: null,
     error: null,
     createdAt: new Date().toISOString(),

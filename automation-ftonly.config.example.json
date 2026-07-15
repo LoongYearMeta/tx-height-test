@@ -25,8 +25,9 @@
     "randomMaxMb": 1100,
     "maxFtCount": 0,
     "broadcast": true,
-    "broadcastBatchSize": 10,
-    "broadcastDelayMs": 250,
+    "broadcastBatchSize": 250,
+    "broadcastDelayMs": 0,
+    "broadcastGroupConcurrency": 4,
     "writeLocalTxs": false,
     "cli": "/home/nemo/TBCNODE/bin/bitcoin-cli",
     "conf": "/home/nemo/TBCNODE/node.main.conf"
