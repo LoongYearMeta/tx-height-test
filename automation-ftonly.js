@@ -53,21 +53,19 @@ const DEFAULTS = {
     ftAmount: 1,
     decimal: 6,
     to: '1Nykpv2CofTzpE1knswfVtLgrHFnHavsK7',
-    // 默认每个新区块任务目标固定为 1 GiB；资金不足时以资金耗尽为成功终点。
-    randomMinMb: 1024,
-    randomMaxMb: 1024,
+    randomMinMb: 900,
+    randomMaxMb: 1100,
     maxFtCount: 0,
     broadcast: true,
-    broadcastBatchSize: 100,
-    broadcastDelayMs: 0,
+    broadcastBatchSize: 10,
+    broadcastDelayMs: 250,
     writeLocalTxs: false,
-    constructionWorkers: 4,
     cli: '/home/nemo/TBCNODE/bin/bitcoin-cli',
     conf: '/home/nemo/TBCNODE/node.main.conf',
   },
 
   maxGenerators: 2,
-  maxBroadcasts: 1,
+  maxBroadcasts: 2,
   maxBroadcastRetries: 3,
   pollInterval: 10000,
   rpcTimeout: 30000,
@@ -260,7 +258,6 @@ function startGenerator(entry) {
     '--rpc-url', CONFIG.rpc.url,
     '--rpc-user', CONFIG.rpc.username,
     '--rpc-pass', CONFIG.rpc.password,
-    '--construction-workers', String(g.constructionWorkers),
   ];
 
   if (g.maxFtCount > 0) args.push('--max-ft-count', String(g.maxFtCount));
@@ -378,9 +375,6 @@ function getBroadcastFiles(entry) {
   const metadataFile = path.join(entry.outputDir, 'metadata.json');
   try {
     const meta = JSON.parse(fs.readFileSync(metadataFile, 'utf8'));
-    if (Array.isArray(meta.files?.layers) && meta.files.layers.length > 0) {
-      return meta.files.layers;
-    }
     if (meta.files?.prepare && Array.isArray(meta.files.groups)) {
       return [meta.files.prepare, ...meta.files.groups];
     }
@@ -450,13 +444,9 @@ async function broadcastBatch(batch, logFile) {
     const summary = summarizeBatchResult(result);
     if (summary.note) appendBroadcastLog(logFile, `  batch=${batch.length} ${summary.note}`);
     if (summary.rejected > 0) {
-      const rejection = new Error(`sendrawtransactions rejected ${summary.rejected}/${summary.total}: ${summary.firstError || 'unknown'}`);
-      rejection.batchRejected = true;
-      throw rejection;
+      throw new Error(`sendrawtransactions rejected ${summary.rejected}/${summary.total}: ${summary.firstError || 'unknown'}`);
     }
   } catch (err) {
-    // 节点明确拒绝时不要把整批再次串行发送；这会重复验证已接受交易并掩盖根因。
-    if (err.batchRejected) throw err;
     appendBroadcastLog(logFile, `  batch=${batch.length} fallback-single: ${err.message}`);
     for (const raw of batch) await sendRawAllowAlready(raw);
   }
@@ -574,11 +564,6 @@ function generatedBytes(outputDir) {
   let total = 0;
   const names = ['ft_prepare.txt', 'metadata.json', 'automation-ftonly.log'];
   for (let i = 0; i < CONFIG.generator.groups; i++) names.push(`ft_group_${i}.txt`);
-  try {
-    for (const name of fs.readdirSync(outputDir)) {
-      if (/^ft_layer_\d+\.txt$/.test(name)) names.push(name);
-    }
-  } catch (_) {}
   for (const name of names) {
     const file = path.join(outputDir, name);
     try {
