@@ -3,7 +3,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFileSync, fork } = require('child_process');
 const readline = require('readline');
 const minimist = require('minimist');
 const axios = require('axios');
@@ -17,8 +17,9 @@ const argv = minimist(process.argv.slice(2), {
     'privkey', 'txid', 'vout', 'satoshis', 'script', 'to', 'name', 'symbol',
     'outputdir', 'cli', 'conf', 'target-bytes', 'target-mb', 'target-gb',
     'random-min-mb', 'random-max-mb', 'seed', 'rpc-url', 'rpc-user', 'rpc-pass',
+    'worker-suffix',
   ],
-  boolean: ['broadcast', 'latest-coinbase', 'write-local-txs', 'random-target', 'help'],
+  boolean: ['broadcast', 'latest-coinbase', 'write-local-txs', 'random-target', 'bundle-worker', 'help'],
   alias: {
     g: 'groups',
     x: 'per-group',
@@ -37,6 +38,8 @@ const argv = minimist(process.argv.slice(2), {
     conf: '/home/nemo/TBCNODE/node.main.conf',
     to: '1Nykpv2CofTzpE1knswfVtLgrHFnHavsK7',
     'max-ft-count': 0,
+    'fee-per-kb': 150,
+    'construction-workers': 1,
     'broadcast-batch-size': 1,
     'broadcast-delay-ms': 250,
     'random-target': true,
@@ -67,6 +70,8 @@ Options:
   --random-max-mb <N>       random target upper bound, default 10000
   --seed <TEXT>             deterministic random target seed
   --max-ft-count <N>        optional hard cap for auto-created FT bundles
+  --fee-per-kb <SAT>        construction fee rate in sat/KB, default 150
+  --construction-workers N  persistent bounded bundle workers, default 1
   --write-local-txs         write local txid/raw JSONL index; off by default
   --rpc-url <URL>           RPC HTTP URL, preferred over bitcoin-cli when provided
   --rpc-user <USER>         RPC username for --rpc-url
@@ -90,9 +95,13 @@ const GROUP_FILE = (i) => path.join(OUTPUT_DIR, `ft_group_${i}.txt`);
 const TX_MAP_FILE = path.join(OUTPUT_DIR, 'local_txs.json');
 const TX_MAP_JSONL_FILE = path.join(OUTPUT_DIR, 'local_txs.jsonl');
 const META_FILE = path.join(OUTPUT_DIR, 'metadata.json');
+const WORKER_SUFFIX = argv['worker-suffix'] ? `.${argv['worker-suffix']}` : '';
+const ACTIVE_PREPARE_FILE = WORKER_SUFFIX ? `${PREPARE_FILE}${WORKER_SUFFIX}` : PREPARE_FILE;
+const ACTIVE_GROUP_FILE = (i) => WORKER_SUFFIX ? `${GROUP_FILE(i)}${WORKER_SUFFIX}` : GROUP_FILE(i);
+const ACTIVE_TX_MAP_FILE = WORKER_SUFFIX ? `${TX_MAP_JSONL_FILE}${WORKER_SUFFIX}` : TX_MAP_JSONL_FILE;
 
 const EST_TX_BYTES = 5500;
-const FEE_PER_KB = 150;
+const FEE_PER_KB = positiveNumber(argv['fee-per-kb'], 'fee-per-kb');
 const FEE_SAFETY = 1.3;
 const DUST_PER_TX = 500;
 const PREPARE_FT_AMOUNT = X_PER_GROUP * FT_AMOUNT + 1;
@@ -111,10 +120,12 @@ const MAX_FT_COUNT = Number(argv['max-ft-count']) || 0;
 const BROADCAST_BATCH_SIZE = positiveInt(argv['broadcast-batch-size'], 'broadcast-batch-size');
 const BROADCAST_DELAY_MS = nonNegativeNumber(argv['broadcast-delay-ms'], 'broadcast-delay-ms');
 const MAX_FANOUT_OUTPUTS = 500;
+const CONSTRUCTION_WORKERS = positiveInt(argv['construction-workers'], 'construction-workers');
 
 fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
-main().catch((e) => {
+const entrypoint = argv['bundle-worker'] ? workerMain() : main();
+entrypoint.catch((e) => {
   console.error(e.stack || e.message);
   process.exit(1);
 });
@@ -145,14 +156,7 @@ async function main() {
 
   for (const raw of roots.splitRaws) writeRaw(PREPARE_FILE, raw, counters, 'prepare');
 
-  const contracts = [];
-  for (let i = 0; i < ftCount; i++) {
-    const result = generateFtBundle(i, roots.utxos[i], counters);
-    contracts.push(result);
-    if ((i + 1) % 25 === 0 || i + 1 === ftCount) {
-      console.log(`生成进度: ${i + 1}/${ftCount} FT bundles, raw ${(counters.bytes / 1024 / 1024).toFixed(2)} MB`);
-    }
-  }
+  const contracts = await generateBundles(roots.utxos, counters);
 
   fs.writeFileSync(META_FILE, JSON.stringify({
     addressA,
@@ -175,6 +179,7 @@ async function main() {
     ftAmount: FT_AMOUNT,
     prepareFtAmount: PREPARE_FT_AMOUNT,
     feePerGroupSat: FEE_PER_GROUP_SAT,
+    feePerKbSat: FEE_PER_KB,
     files: {
       prepare: PREPARE_FILE,
       groups: Array.from({ length: N_GROUPS }, (_, i) => GROUP_FILE(i)),
@@ -197,6 +202,138 @@ async function main() {
   }
 }
 
+async function workerMain() {
+  resetWorkerFiles();
+  // 父生成器退出或被 watchdog 终止时，worker 必须立即退出，不能成为孤儿进程。
+  process.once('disconnect', () => process.exit(1));
+  process.on('message', (message) => {
+    if (message?.type === 'stop') process.exit(0);
+    if (message?.type !== 'bundle') return;
+    try {
+      const counters = { prepare: 0, group: 0, bytes: 0 };
+      const result = generateFtBundle(message.index, message.utxo, counters);
+      process.send({ type: 'done', index: message.index, result, counters });
+    } catch (error) {
+      process.send({ type: 'error', index: message.index, error: error.stack || error.message });
+    }
+  });
+  await new Promise(() => {});
+}
+
+async function generateBundles(utxos, counters) {
+  const workerCount = Math.min(CONSTRUCTION_WORKERS, utxos.length);
+  if (workerCount <= 1) {
+    const contracts = [];
+    for (let i = 0; i < utxos.length; i++) {
+      contracts.push(generateFtBundle(i, utxos[i], counters));
+      printGenerationProgress(i + 1, utxos.length, counters.bytes);
+    }
+    return contracts;
+  }
+
+  const contracts = new Array(utxos.length);
+  let nextIndex = 0;
+  let completed = 0;
+  const workers = Array.from({ length: workerCount }, (_, slot) => createBundleWorker(slot));
+  try {
+    await Promise.all(workers.map(async (worker) => {
+      while (nextIndex < utxos.length) {
+        const index = nextIndex++;
+        const message = await runWorkerBundle(worker.child, index, utxos[index]);
+        contracts[index] = message.result;
+        counters.prepare += message.counters.prepare;
+        counters.group += message.counters.group;
+        counters.bytes += message.counters.bytes;
+        completed++;
+        printGenerationProgress(completed, utxos.length, counters.bytes);
+      }
+    }));
+  } finally {
+    for (const worker of workers) {
+      if (worker.child.connected) worker.child.send({ type: 'stop' });
+    }
+    await Promise.all(workers.map((worker) => waitForExit(worker.child)));
+  }
+
+  for (const worker of workers) {
+    await appendFile(ACTIVE_PREPARE_FILE, worker.prepareFile);
+    for (let group = 0; group < N_GROUPS; group++) {
+      await appendFile(ACTIVE_GROUP_FILE(group), worker.groupFiles[group]);
+    }
+    if (argv['write-local-txs']) await appendFile(ACTIVE_TX_MAP_FILE, worker.txMapFile);
+    removeWorkerFiles(worker);
+  }
+  return contracts;
+}
+
+function createBundleWorker(slot) {
+  const suffix = `worker-${process.pid}-${slot}`;
+  const args = [...process.argv.slice(2), '--bundle-worker', '--worker-suffix', suffix];
+  const child = fork(__filename, args, { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
+  return {
+    child,
+    prepareFile: `${PREPARE_FILE}.${suffix}`,
+    groupFiles: Array.from({ length: N_GROUPS }, (_, i) => `${GROUP_FILE(i)}.${suffix}`),
+    txMapFile: `${TX_MAP_JSONL_FILE}.${suffix}`,
+  };
+}
+
+function runWorkerBundle(child, index, utxo) {
+  return new Promise((resolve, reject) => {
+    const onMessage = (message) => {
+      if (message?.index !== index) return;
+      cleanup();
+      if (message.type === 'done') resolve(message);
+      else reject(new Error(`bundle worker ${index}: ${message.error || 'unknown error'}`));
+    };
+    const onExit = (code, signal) => {
+      cleanup();
+      reject(new Error(`bundle worker exited index=${index} code=${code} signal=${signal || ''}`));
+    };
+    const cleanup = () => {
+      child.off('message', onMessage);
+      child.off('exit', onExit);
+    };
+    child.on('message', onMessage);
+    child.once('exit', onExit);
+    child.send({ type: 'bundle', index, utxo });
+  });
+}
+
+function waitForExit(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => child.once('exit', resolve));
+}
+
+function printGenerationProgress(done, total, bytes) {
+  if (done % 25 === 0 || done === total) {
+    console.log(`生成进度: ${done}/${total} FT bundles, raw ${(bytes / 1024 / 1024).toFixed(2)} MB`);
+  }
+}
+
+function appendFile(target, source) {
+  return new Promise((resolve, reject) => {
+    const input = fs.createReadStream(source);
+    const output = fs.createWriteStream(target, { flags: 'a' });
+    input.once('error', reject);
+    output.once('error', reject);
+    output.once('finish', resolve);
+    input.pipe(output);
+  });
+}
+
+function resetWorkerFiles() {
+  fs.writeFileSync(ACTIVE_PREPARE_FILE, '');
+  for (let i = 0; i < N_GROUPS; i++) fs.writeFileSync(ACTIVE_GROUP_FILE(i), '');
+  if (argv['write-local-txs']) fs.writeFileSync(ACTIVE_TX_MAP_FILE, '');
+}
+
+function removeWorkerFiles(worker) {
+  for (const file of [worker.prepareFile, ...worker.groupFiles, ...(argv['write-local-txs'] ? [worker.txMapFile] : [])]) {
+    try { fs.unlinkSync(file); } catch (_) {}
+  }
+}
+
 function generateFtBundle(index, initialUtxo, counters) {
   const localTxMap = new Map();
   const suffix = index === 0 ? '' : String(index);
@@ -210,8 +347,8 @@ function generateFtBundle(index, initialUtxo, counters) {
   const mintRaws = ft.MintFT(privateKey, addressA, initialUtxo);
   const txSource = rememberRaw(mintRaws[0], localTxMap);
   const txMint = rememberRaw(mintRaws[1], localTxMap);
-  writeRaw(PREPARE_FILE, mintRaws[0], counters, 'prepare', txSource.hash);
-  writeRaw(PREPARE_FILE, mintRaws[1], counters, 'prepare', txMint.hash);
+  writeRaw(ACTIVE_PREPARE_FILE, mintRaws[0], counters, 'prepare', txSource.hash);
+  writeRaw(ACTIVE_PREPARE_FILE, mintRaws[1], counters, 'prepare', txMint.hash);
 
   let currentFt = {
     utxo: buildUTXO(txMint, 0, true),
@@ -235,7 +372,7 @@ function generateFtBundle(index, initialUtxo, counters) {
       satToTbc(FEE_PER_GROUP_SAT)
     );
     const tx = rememberRaw(raw, localTxMap);
-    writeRaw(PREPARE_FILE, raw, counters, 'prepare', tx.hash);
+    writeRaw(ACTIVE_PREPARE_FILE, raw, counters, 'prepare', tx.hash);
 
     groupStates.push({
       ft: {
@@ -274,7 +411,7 @@ function generateFtBundle(index, initialUtxo, counters) {
         [prepre]
       );
       const tx = rememberRaw(raw, localTxMap);
-      writeRaw(GROUP_FILE(g), raw, counters, 'group', tx.hash);
+      writeRaw(ACTIVE_GROUP_FILE(g), raw, counters, 'group', tx.hash);
 
       state = {
         utxo: buildUTXO(tx, 2, true),
@@ -454,6 +591,14 @@ function createRng(seedText) {
 }
 
 function resetOutputFiles() {
+  try {
+    for (const name of fs.readdirSync(OUTPUT_DIR)) {
+      if (/^(ft_prepare|ft_group_\d+|local_txs\.jsonl)\.txt\.worker-/.test(name) ||
+          /^local_txs\.jsonl\.worker-/.test(name)) {
+        fs.unlinkSync(path.join(OUTPUT_DIR, name));
+      }
+    }
+  } catch (_) {}
   fs.writeFileSync(PREPARE_FILE, '');
   for (let i = 0; i < N_GROUPS; i++) fs.writeFileSync(GROUP_FILE(i), '');
   if (argv['write-local-txs']) fs.writeFileSync(TX_MAP_JSONL_FILE, '');
@@ -465,7 +610,7 @@ function writeRaw(file, raw, counters, kind, txId) {
   if (kind === 'prepare') counters.prepare++;
   if (kind === 'group') counters.group++;
   if (argv['write-local-txs']) {
-    fs.appendFileSync(TX_MAP_JSONL_FILE, JSON.stringify({ txId: txId || new Transaction(raw).hash, raw }) + '\n');
+    fs.appendFileSync(ACTIVE_TX_MAP_FILE, JSON.stringify({ txId: txId || new Transaction(raw).hash, raw }) + '\n');
   }
 }
 

@@ -7,13 +7,22 @@
   "coinbasePrivKey": "L1u2TmR7hMMMSV9Bx2Lyt3sujbboqEFqnKygnPRnQERhKB4qptuK",
   "outputBaseDir": "./ftonly-output",
   "ledgerFile": "./automation-ftonly-ledger.json",
-  "maxGenerators": 2,
+  "maxGenerators": 1,
   "maxBroadcasts": 2,
   "maxBroadcastRetries": 3,
   "pollInterval": 10000,
   "rpcTimeout": 30000,
   "generatorStallTimeoutMs": 600000,
   "rpcCooldownAfterGeneratorMs": 60000,
+  "resourceLimits": {
+    "minAvailableMemoryMb": 6144,
+    "criticalAvailableMemoryMb": 2048,
+    "memoryPerConstructionWorkerMb": 512,
+    "minFreeDiskMb": 51200,
+    "criticalFreeDiskMb": 10240,
+    "maxGeneratedBacklog": 2,
+    "maxMempoolUsageRatio": 0.75
+  },
   "stopCreatingNew": false,
   "generator": {
     "groups": 4,
@@ -28,6 +37,8 @@
     "broadcastBatchSize": 250,
     "broadcastDelayMs": 0,
     "broadcastGroupConcurrency": 4,
+    "constructionWorkers": 4,
+    "feePerKbSat": 150,
     "writeLocalTxs": false,
     "cli": "/home/nemo/TBCNODE/bin/bitcoin-cli",
     "conf": "/home/nemo/TBCNODE/node.main.conf"

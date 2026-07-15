@@ -61,18 +61,29 @@ const DEFAULTS = {
     broadcastBatchSize: 250,
     broadcastDelayMs: 0,
     broadcastGroupConcurrency: 4,
+    constructionWorkers: 4,
+    feePerKbSat: 150,
     writeLocalTxs: false,
     cli: '/home/nemo/TBCNODE/bin/bitcoin-cli',
     conf: '/home/nemo/TBCNODE/node.main.conf',
   },
 
-  maxGenerators: 2,
+  maxGenerators: 1,
   maxBroadcasts: 2,
   maxBroadcastRetries: 3,
   pollInterval: 10000,
   rpcTimeout: 30000,
   generatorStallTimeoutMs: 10 * 60 * 1000,
   rpcCooldownAfterGeneratorMs: 60 * 1000,
+  resourceLimits: {
+    minAvailableMemoryMb: 6144,
+    criticalAvailableMemoryMb: 2048,
+    memoryPerConstructionWorkerMb: 512,
+    minFreeDiskMb: 51200,
+    criticalFreeDiskMb: 10240,
+    maxGeneratedBacklog: 2,
+    maxMempoolUsageRatio: 0.75,
+  },
   stopCreatingNew: false,
 };
 
@@ -90,6 +101,13 @@ let lastHeight = 0;
 let loopRunning = false;
 let rpcGateClosedUntil = 0;
 let rpcGateReason = '';
+let resourceState = {
+  generationAllowed: true,
+  broadcastAllowed: true,
+  constructionWorkers: 1,
+  reason: '',
+};
+let lastResourceMessage = '';
 
 recoverStale(ledger);
 
@@ -122,6 +140,7 @@ async function mainLoop() {
   }
 
   const height = await rpc('getblockcount', [], CONFIG.rpcTimeout);
+  await refreshResourceState();
   if (lastHeight === 0) {
     const ledgerMaxHeight = getLedgerMaxHeight(ledger);
     lastHeight = ledgerMaxHeight > 0 ? ledgerMaxHeight : height;
@@ -240,6 +259,7 @@ async function extractCoinbaseUTXO(block) {
 
 function drainPending() {
   if (isRpcGateClosed()) return;
+  if (!resourceState.generationAllowed) return;
   while (activeGenerators.size < CONFIG.maxGenerators) {
     const entry = ledger.entries.find((e) => e.status === 'pending');
     if (!entry) return;
@@ -271,6 +291,8 @@ function startGenerator(entry) {
     '--rpc-url', CONFIG.rpc.url,
     '--rpc-user', CONFIG.rpc.username,
     '--rpc-pass', CONFIG.rpc.password,
+    '--construction-workers', String(resourceState.constructionWorkers),
+    '--fee-per-kb', String(g.feePerKbSat),
   ];
 
   if (g.maxFtCount > 0) args.push('--max-ft-count', String(g.maxFtCount));
@@ -328,6 +350,7 @@ function startGenerator(entry) {
 function drainReadyBroadcasts() {
   if (!CONFIG.generator.broadcast) return;
   if (isRpcGateClosed()) return;
+  if (!resourceState.broadcastAllowed) return;
   while (activeBroadcasts.size < CONFIG.maxBroadcasts) {
     const entry = ledger.entries.find((e) => e.status === 'generated' && broadcastFilesReady(e));
     if (!entry) return;
@@ -605,6 +628,13 @@ function checkGeneratorWatchdogs() {
     const entry = ledger.entries.find((e) => e.id === id);
     if (!entry) continue;
 
+    if (resourceState.availableMemoryMb < CONFIG.resourceLimits.criticalAvailableMemoryMb ||
+        resourceState.freeDiskMb < CONFIG.resourceLimits.criticalFreeDiskMb) {
+      console.error(`[资源保护] ${id} 可用内存=${resourceState.availableMemoryMb}MB 磁盘=${resourceState.freeDiskMb}MB，终止生成器`);
+      try { active.process.kill('SIGTERM'); } catch (_) {}
+      continue;
+    }
+
     const bytes = generatedBytes(entry.outputDir);
     if (bytes > active.lastBytes) {
       active.lastBytes = bytes;
@@ -623,6 +653,75 @@ function checkGeneratorWatchdogs() {
       generatorFinishedAt: new Date().toISOString(),
       error: `watchdog: generated files/log stalled for ${CONFIG.generatorStallTimeoutMs}ms`,
     });
+  }
+}
+
+async function refreshResourceState() {
+  const availableMemoryMb = getAvailableMemoryMb();
+  const freeDiskMb = getFreeDiskMb(CONFIG.outputBaseDir);
+  const limits = CONFIG.resourceLimits;
+  const backlog = ledger.entries.filter((entry) => entry.status === 'generated' || entry.status === 'broadcasting').length;
+  let mempool = null;
+  try { mempool = await rpc('getmempoolinfo', [], CONFIG.rpcTimeout); } catch (_) {}
+
+  const mempoolUsage = Number(mempool?.usage ?? mempool?.bytes ?? 0);
+  const maxMempool = Number(mempool?.maxmempool ?? 0);
+  const mempoolRatio = maxMempool > 0 ? mempoolUsage / maxMempool : 0;
+  const mempoolMinFee = Number(mempool?.mempoolminfee ?? 0);
+  const generatedFee = Number(CONFIG.generator.feePerKbSat || 150) / 1e6;
+  const reasons = [];
+  if (availableMemoryMb < limits.minAvailableMemoryMb) reasons.push(`memory ${availableMemoryMb}MB<${limits.minAvailableMemoryMb}MB`);
+  if (freeDiskMb < limits.minFreeDiskMb) reasons.push(`disk ${freeDiskMb}MB<${limits.minFreeDiskMb}MB`);
+  if (backlog >= limits.maxGeneratedBacklog) reasons.push(`backlog ${backlog}>=${limits.maxGeneratedBacklog}`);
+  if (mempoolRatio >= limits.maxMempoolUsageRatio) reasons.push(`mempool ${(mempoolRatio * 100).toFixed(1)}%`);
+  if (mempoolMinFee > generatedFee) reasons.push(`mempoolMinFee ${mempoolMinFee}>txFee ${generatedFee}`);
+
+  const workerCapacity = Math.floor(
+    Math.max(0, availableMemoryMb - limits.minAvailableMemoryMb) /
+    Math.max(1, limits.memoryPerConstructionWorkerMb)
+  );
+  const constructionWorkers = Math.max(1, Math.min(
+    Number(CONFIG.generator.constructionWorkers) || 1,
+    workerCapacity
+  ));
+  resourceState = {
+    generationAllowed: reasons.length === 0 && workerCapacity >= 1,
+    broadcastAllowed: mempoolRatio < limits.maxMempoolUsageRatio && mempoolMinFee <= generatedFee,
+    constructionWorkers,
+    availableMemoryMb,
+    freeDiskMb,
+    backlog,
+    mempoolRatio,
+    mempoolMinFee,
+    reason: reasons.join(', '),
+  };
+
+  const signature = reasons.length > 0 ? `paused:${reasons.join('|')}` : `healthy:${constructionWorkers}`;
+  const message = reasons.length > 0
+    ? `[资源暂停] ${resourceState.reason}`
+    : `[资源正常] memory=${availableMemoryMb}MB disk=${freeDiskMb}MB mempool=${(mempoolRatio * 100).toFixed(1)}% workers=${constructionWorkers}`;
+  if (signature !== lastResourceMessage) {
+    console.log(message);
+    lastResourceMessage = signature;
+  }
+}
+
+function getAvailableMemoryMb() {
+  try {
+    const text = fs.readFileSync('/proc/meminfo', 'utf8');
+    const match = text.match(/^MemAvailable:\s+(\d+)\s+kB$/m);
+    if (match) return Math.floor(Number(match[1]) / 1024);
+  } catch (_) {}
+  return Number.MAX_SAFE_INTEGER;
+}
+
+function getFreeDiskMb(target) {
+  try {
+    fs.mkdirSync(target, { recursive: true });
+    const stat = fs.statfsSync(target);
+    return Math.floor(Number(stat.bavail) * Number(stat.bsize) / 1024 / 1024);
+  } catch (_) {
+    return Number.MAX_SAFE_INTEGER;
   }
 }
 
