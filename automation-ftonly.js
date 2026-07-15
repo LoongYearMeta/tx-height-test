@@ -82,12 +82,9 @@ if (argv.config) {
   CONFIG = deepMerge(CONFIG, ext);
   console.log(`[配置] 已加载: ${argv.config}`);
 }
-const NOMINAL_MAX_BROADCASTS = Number(CONFIG.maxBroadcasts) || 2;
-const NOMINAL_BATCH_SIZE = Number(CONFIG.generator.broadcastBatchSize) || 100;
 
 const activeGenerators = new Map();
 const activeBroadcasts = new Map();
-let healthyBatchStreak = 0;
 let ledger = loadLedger();
 let lastHeight = 0;
 let loopRunning = false;
@@ -319,7 +316,6 @@ function startGenerator(entry) {
 
 function drainReadyBroadcasts() {
   if (!CONFIG.generator.broadcast) return;
-  if (isRpcGateClosed()) return;
   while (activeBroadcasts.size < CONFIG.maxBroadcasts) {
     // 新格式按依赖层广播，能利用同层并行；优先让它占用空闲广播槽位。
     // 旧格式任务仍保留，在没有新格式任务或有剩余槽位时继续推进。
@@ -374,10 +370,6 @@ async function runBroadcast(entry, logFile) {
     const retries = (cur?.broadcastRetries || 0) + 1;
     const giveUp = retries >= CONFIG.maxBroadcastRetries;
     console.error(`[广播失败] ${entry.id}: ${err.message} retry=${retries}/${CONFIG.maxBroadcastRetries}`);
-    if (err.response?.status === 500) {
-      CONFIG.maxBroadcasts = 1;
-      console.error('[广播限流] 节点返回 HTTP 500，广播并发降为 1');
-    }
     appendBroadcastLog(logFile, `[error] ${new Date().toISOString()} ${err.stack || err.message}`);
     updateEntry(entry.id, giveUp ? 'failed' : 'generated', {
       broadcastFinishedAt: new Date().toISOString(),
@@ -421,7 +413,7 @@ async function broadcastFile(file, logFile) {
     crlfDelay: Infinity,
   });
 
-  let batchSize = CONFIG.generator.broadcastBatchSize;
+  const batchSize = CONFIG.generator.broadcastBatchSize;
   const delayMs = CONFIG.generator.broadcastDelayMs;
   let batch = [];
   let sent = 0;
@@ -432,10 +424,9 @@ async function broadcastFile(file, logFile) {
     if (batchSize > 1) {
       batch.push(raw);
       if (batch.length >= batchSize) {
-        await broadcastBatchAdaptive(batch, logFile);
+        await broadcastBatch(batch, logFile);
         sent += batch.length;
         batch = [];
-        batchSize = Math.max(1, Number(CONFIG.generator.broadcastBatchSize) || batchSize);
         await delay(delayMs);
       }
     } else {
@@ -450,41 +441,11 @@ async function broadcastFile(file, logFile) {
   }
 
   if (batch.length > 0) {
-    await broadcastBatchAdaptive(batch, logFile);
+    await broadcastBatch(batch, logFile);
     sent += batch.length;
     await delay(delayMs);
   }
   appendBroadcastLog(logFile, `  ${path.basename(file)} done=${sent}`);
-}
-
-async function broadcastBatchAdaptive(batch, logFile) {
-  const maxRetries = 8;
-  for (let attempt = 0; ; attempt++) {
-    try {
-      await broadcastBatch(batch, logFile);
-      healthyBatchStreak++;
-      if (healthyBatchStreak >= 5) {
-        healthyBatchStreak = 0;
-        CONFIG.maxBroadcasts = NOMINAL_MAX_BROADCASTS;
-        const configuredBatch = NOMINAL_BATCH_SIZE;
-        CONFIG.generator.broadcastBatchSize = Math.min(configuredBatch, Math.max(1, (Number(CONFIG.generator.broadcastBatchSize) || 1) * 2));
-      }
-      return;
-    } catch (err) {
-      const status = err.response?.status;
-      const text = String(err.message || err);
-      const overloaded = status === 500 || /work queue|queue depth|mempool full|timeout/i.test(text);
-      if (!overloaded || attempt >= maxRetries) throw err;
-      const oldSize = Number(CONFIG.generator.broadcastBatchSize) || batch.length;
-      const newSize = Math.max(1, Math.floor(oldSize / 2));
-      healthyBatchStreak = 0;
-      CONFIG.maxBroadcasts = 1;
-      CONFIG.generator.broadcastBatchSize = newSize;
-      const delayMs = Math.min(30000, 2000 * (2 ** attempt));
-      appendBroadcastLog(logFile, `  congested retry=${attempt + 1}/${maxRetries} batch=${batch.length} nextBatch=${newSize} wait=${delayMs}ms`);
-      await delay(delayMs);
-    }
-  }
 }
 
 async function broadcastBatch(batch, logFile) {
@@ -510,8 +471,6 @@ async function broadcastBatch(batch, logFile) {
   } catch (err) {
     // 节点明确拒绝时不要把整批再次串行发送；这会重复验证已接受交易并掩盖根因。
     if (err.batchRejected) throw err;
-    // HTTP 500 通常表示节点 work queue/RPC 过载；串行回退会进一步放大压力。
-    if (err.response?.status === 500) throw err;
     appendBroadcastLog(logFile, `  batch=${batch.length} fallback-single: ${err.message}`);
     for (const raw of batch) await sendRawAllowAlready(raw);
   }
