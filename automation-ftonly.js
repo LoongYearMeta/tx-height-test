@@ -58,7 +58,8 @@ const DEFAULTS = {
     randomMaxMb: 1024,
     maxFtCount: 0,
     broadcast: true,
-    broadcastBatchSize: 100,
+    // 从单笔建立节点成功基线；连续成功后由自适应流控逐步放大。
+    broadcastBatchSize: 1,
     broadcastDelayMs: 0,
     writeLocalTxs: false,
     constructionWorkers: 4,
@@ -66,7 +67,8 @@ const DEFAULTS = {
     conf: '/home/nemo/TBCNODE/node.main.conf',
   },
 
-  maxGenerators: 2,
+  // 每个 generator 内部默认 4 个 construction workers；避免同时启动 8 个子进程争抢内存。
+  maxGenerators: 1,
   maxBroadcasts: 2,
   maxBroadcastRetries: 3,
   pollInterval: 10000,
@@ -187,18 +189,26 @@ function closeRpcGate(ms, reason) {
 }
 
 async function rpc(method, params = [], timeout = 30000) {
-  const res = await axios.post(CONFIG.rpc.url, {
-    jsonrpc: '1.0',
-    id: 'ftonly-auto',
-    method,
-    params,
-  }, {
-    auth: {
-      username: CONFIG.rpc.username,
-      password: CONFIG.rpc.password,
-    },
-    timeout,
-  });
+  let res;
+  try {
+    res = await axios.post(CONFIG.rpc.url, {
+      jsonrpc: '1.0',
+      id: 'ftonly-auto',
+      method,
+      params,
+    }, {
+      auth: {
+        username: CONFIG.rpc.username,
+        password: CONFIG.rpc.password,
+      },
+      timeout,
+    });
+  } catch (err) {
+    const body = err.response?.data;
+    const detail = body === undefined ? '' : ` response=${typeof body === 'string' ? body.slice(0, 1000) : JSON.stringify(body).slice(0, 1000)}`;
+    err.message = `${err.message}${detail}`;
+    throw err;
+  }
   if (res.data.error) throw new Error(JSON.stringify(res.data.error));
   return res.data.result;
 }
@@ -472,7 +482,8 @@ async function broadcastBatchAdaptive(batch, logFile) {
       return;
     } catch (err) {
       const status = err.response?.status;
-      const text = String(err.message || err);
+      const detail = err.response?.data ? ` ${JSON.stringify(err.response.data).slice(0, 500)}` : '';
+      const text = `${String(err.message || err)}${detail}`;
       const overloaded = status === 500 || /work queue|queue depth|mempool full|timeout/i.test(text);
       if (!overloaded || attempt >= maxRetries) throw err;
       const oldSize = Number(CONFIG.generator.broadcastBatchSize) || batch.length;
@@ -481,7 +492,7 @@ async function broadcastBatchAdaptive(batch, logFile) {
       CONFIG.maxBroadcasts = 1;
       CONFIG.generator.broadcastBatchSize = newSize;
       const delayMs = Math.min(30000, 2000 * (2 ** attempt));
-      appendBroadcastLog(logFile, `  congested retry=${attempt + 1}/${maxRetries} batch=${batch.length} nextBatch=${newSize} wait=${delayMs}ms`);
+      appendBroadcastLog(logFile, `  congested retry=${attempt + 1}/${maxRetries} batch=${batch.length} nextBatch=${newSize} wait=${delayMs}ms${detail}`);
       await delay(delayMs);
     }
   }
