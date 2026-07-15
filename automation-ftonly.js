@@ -706,21 +706,10 @@ function recoverStale(ledgerObj) {
   let changed = false;
   for (const e of ledgerObj.entries) {
     if (e.status === 'generating') {
-      // 生成阶段尚未广播 funding/FT 交易，恢复为 pending 可由新构造脚本接管。
-      e.status = 'pending';
-      e.error = 'recovery: generator died on restart; requeued';
+      e.status = 'failed';
+      e.error = 'recovery: generator died on restart';
       changed = true;
-      console.log(`[恢复] ${e.id}: generating -> pending`);
-    } else if (e.status === 'failed' && isRecoverableGenerationFailure(e.error)) {
-      const retries = Number(e.generatorRetries || 0);
-      if (retries < 3) {
-        e.status = 'pending';
-        e.generatorRetries = retries + 1;
-        e.error = 'recovery: previous generator failure; requeued';
-        e.generatorPid = null;
-        changed = true;
-        console.log(`[恢复] ${e.id}: failed(generator) -> pending (${e.generatorRetries}/3)`);
-      }
+      console.log(`[恢复] ${e.id}: generating -> failed`);
     } else if (e.status === 'broadcasting') {
       e.status = 'generated';
       e.error = 'recovery: broadcast died on restart';
@@ -729,14 +718,6 @@ function recoverStale(ledgerObj) {
     }
   }
   if (changed) saveLedger();
-}
-
-function isRecoverableGenerationFailure(error) {
-  const text = String(error || '').toLowerCase();
-  return text.includes('generator exit') ||
-    text.includes('generator killed') ||
-    text.includes('watchdog') ||
-    text.includes('generator died on restart');
 }
 
 function isUtxoUsed(ledgerObj, utxo) {
