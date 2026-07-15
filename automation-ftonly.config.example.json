@@ -37,6 +37,7 @@
     "broadcastBatchSize": 250,
     "broadcastDelayMs": 0,
     "broadcastGroupConcurrency": 4,
+    "dontCheckFee": true,
     "constructionWorkers": 4,
     "feePerKbSat": 150,
     "writeLocalTxs": false,

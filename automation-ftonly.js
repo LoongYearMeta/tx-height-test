@@ -62,6 +62,9 @@ const DEFAULTS = {
     broadcastBatchSize: 250,
     broadcastDelayMs: 0,
     broadcastGroupConcurrency: 4,
+    // 本工具生成的交易费率已由 feePerKbSat 固定；高容量测试节点可绕过
+    // mempool 的动态滚动最低费率，但仍受 maxmempool 容量限制。
+    dontCheckFee: true,
     constructionWorkers: 4,
     feePerKbSat: 150,
     writeLocalTxs: false,
@@ -376,7 +379,7 @@ function startBroadcast(entry) {
 async function runBroadcast(entry, logFile) {
   let success = false;
   try {
-    appendBroadcastLog(logFile, `[start] ${new Date().toISOString()} id=${entry.id} pid=${process.pid} rpc=${CONFIG.rpc.url}`);
+    appendBroadcastLog(logFile, `[start] ${new Date().toISOString()} id=${entry.id} pid=${process.pid} rpc=${CONFIG.rpc.url} dontcheckfee=${Boolean(CONFIG.generator.dontCheckFee)}`);
     const files = getBroadcastFiles(entry);
     const prepare = files[0];
     appendBroadcastLog(logFile, `[file] ${path.basename(prepare)}`);
@@ -610,7 +613,7 @@ async function broadcastBatch(batch, logFile) {
       batch.map((hex) => ({
         hex,
         allowhighfees: false,
-        dontcheckfee: false,
+        dontcheckfee: Boolean(CONFIG.generator.dontCheckFee),
       })),
     ], CONFIG.rpcTimeout);
     const summary = summarizeBatchResult(result);
@@ -674,7 +677,10 @@ async function getMempoolSummary() {
     if (info && typeof info === 'object') {
       const size = info.size ?? info.transactions ?? info.txcount ?? '?';
       const bytes = info.bytes ?? info.usage ?? '?';
-      return `${size} bytes=${bytes}`;
+      const usage = info.usage ?? '?';
+      const max = info.maxmempool ?? '?';
+      const minFee = info.mempoolminfee ?? '?';
+      return `${size} bytes=${bytes} usage=${usage} max=${max} minfee=${minFee}`;
     }
   } catch (_) {}
   try {
@@ -686,7 +692,11 @@ async function getMempoolSummary() {
 
 async function sendRawAllowAlready(raw) {
   try {
-    await rpc('sendrawtransaction', [raw], CONFIG.rpcTimeout);
+    await rpc('sendrawtransaction', [
+      raw,
+      false,
+      Boolean(CONFIG.generator.dontCheckFee),
+    ], CONFIG.rpcTimeout);
   } catch (err) {
     if (isAlreadyAcceptedError(err)) return;
     throw err;
@@ -754,12 +764,15 @@ async function refreshResourceState() {
   const mempoolRatio = maxMempool > 0 ? mempoolUsage / maxMempool : 0;
   const mempoolMinFee = Number(mempool?.mempoolminfee ?? 0);
   const generatedFee = Number(CONFIG.generator.feePerKbSat || 150) / 1e6;
+  const enforceDynamicMempoolFee = !CONFIG.generator.dontCheckFee;
   const reasons = [];
   if (availableMemoryMb < limits.minAvailableMemoryMb) reasons.push(`memory ${availableMemoryMb}MB<${limits.minAvailableMemoryMb}MB`);
   if (freeDiskMb < limits.minFreeDiskMb) reasons.push(`disk ${freeDiskMb}MB<${limits.minFreeDiskMb}MB`);
   if (backlog >= limits.maxGeneratedBacklog) reasons.push(`backlog ${backlog}>=${limits.maxGeneratedBacklog}`);
   if (mempoolRatio >= limits.maxMempoolUsageRatio) reasons.push(`mempool ${(mempoolRatio * 100).toFixed(1)}%`);
-  if (mempoolMinFee > generatedFee) reasons.push(`mempoolMinFee ${mempoolMinFee}>txFee ${generatedFee}`);
+  if (enforceDynamicMempoolFee && mempoolMinFee > generatedFee) {
+    reasons.push(`mempoolMinFee ${mempoolMinFee}>txFee ${generatedFee}`);
+  }
 
   const workerCapacity = Math.floor(
     Math.max(0, availableMemoryMb - limits.minAvailableMemoryMb) /
@@ -771,7 +784,9 @@ async function refreshResourceState() {
   ));
   resourceState = {
     generationAllowed: reasons.length === 0 && workerCapacity >= 1,
-    broadcastAllowed: mempoolRatio < limits.maxMempoolUsageRatio && mempoolMinFee <= generatedFee,
+    broadcastAllowed:
+      mempoolRatio < limits.maxMempoolUsageRatio &&
+      (!enforceDynamicMempoolFee || mempoolMinFee <= generatedFee),
     constructionWorkers,
     availableMemoryMb,
     freeDiskMb,
