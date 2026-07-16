@@ -45,8 +45,16 @@ const FLOW_CONFIG = {
     maxBroadcastRetries: 5,
 };
 
-const MAX_GENERATORS = 3;   // 最多同时运行的生成器数量
-const MAX_BROADCASTS = 2;   // 主备双广播并发上限
+// 长子孙链是本脚本的测试对象：单集合构造、单集合广播，避免并行集合污染测量。
+const MAX_GENERATORS = 1;
+const MAX_BROADCASTS = 1;
+const SHUTDOWN_TIMEOUT_MS = 45000;
+const RESOURCE_LIMITS = {
+    minAvailableMemoryMb: 4096,
+    minFreeDiskMb: 20480,
+    maxGeneratedBacklog: 2,
+    maxMempoolUsageRatio: 0.75,
+};
 
 // 设为 true 则不再创建新 pending 条目，仅消耗现有队列
 const STOP_CREATING_NEW = false;
@@ -60,6 +68,10 @@ const flowState = {
 
 const activeGenerators = new Map();
 const activeBroadcasts = new Map();
+let shuttingDown = false;
+let shutdownPromise = null;
+let resourceState = { generationAllowed: true, broadcastAllowed: true, reason: '' };
+let lastResourceMessage = null;
 
 // ========================
 // RPC
@@ -113,7 +125,9 @@ function loadLedger() {
 }
 
 function saveLedger(ledger) {
-    fs.writeFileSync(LEDGER_FILE, JSON.stringify(ledger, null, 2));
+    const tmp = `${LEDGER_FILE}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(ledger, null, 2));
+    fs.renameSync(tmp, LEDGER_FILE);
 }
 
 function isUtxoUsed(ledger, utxo) {
@@ -137,6 +151,7 @@ function addEntry(ledger, height, depth, utxo) {
         generatorFinishedAt: null,
         broadcastStartedAt:  null,
         broadcastFinishedAt: null,
+        seed:                 null,
         createdAt:           new Date().toISOString(),
         error:               null,
     };
@@ -160,9 +175,9 @@ function recoverStale(ledger) {
     let changed = false;
     for (const e of ledger.entries) {
         if (e.status === 'generating') {
-            // generator 进程已死，生成未完成
-            e.status = 'failed'; e.error = 'recovery: generator died on restart'; changed = true;
-            console.log(`[恢复] ${e.id}: generating → failed`);
+            // 构造文件不做中间拼接；保留 seed，从头确定性重建。
+            e.status = 'pending'; e.generatorPid = null; e.error = null; changed = true;
+            console.log(`[恢复] ${e.id}: generating → pending（原 seed 重建）`);
         } else if (e.status === 'broadcasting') {
             // tx 文件已写入磁盘，回退到 generated 让广播重试
             e.status = 'generated'; e.error = null; changed = true;
@@ -208,6 +223,7 @@ function startGenerator(ledger, entry, depth) {
     fs.mkdirSync(entry.outputDir, { recursive: true });
     const logFd = fs.openSync(path.join(entry.outputDir, 'generator.log'), 'a');
 
+    const seed = entry.seed || Date.now();
     const args = [
         'generator-mesh-tx.js',
         '--txid',     entry.sourceUtxo.txId,
@@ -216,6 +232,8 @@ function startGenerator(ledger, entry, depth) {
         '--depth',    String(depth),
         '--outputdir', entry.outputDir,
         '--privkey',  COINBASE_PRIV_KEY,
+        '--seed',     String(seed),
+        '--reuse-keys',
     ];
 
     const child = spawn('node', args, { stdio: ['ignore', logFd, logFd] });
@@ -223,14 +241,20 @@ function startGenerator(ledger, entry, depth) {
     updateEntry(ledger, entry.id, 'generating', {
         generatorPid:       child.pid,
         generatorStartedAt: new Date().toISOString(),
+        seed,
     });
     activeGenerators.set(entry.id, { pid: child.pid, process: child, logFd });
 
     child.on('exit', (code) => {
-        fs.closeSync(logFd);
+        try { fs.closeSync(logFd); } catch (_) {}
         activeGenerators.delete(entry.id);
         const ts = new Date().toISOString();
-        if (code === 0) {
+        if (shuttingDown) {
+            console.log(`[退出保存] ${entry.id}: generating → pending`);
+            updateEntry(ledger, entry.id, 'pending', {
+                generatorPid: null, generatorFinishedAt: ts, interruptedAt: ts, error: null,
+            });
+        } else if (code === 0) {
             console.log(`[生成完成] ${entry.id}`);
             updateEntry(ledger, entry.id, 'generated', { generatorFinishedAt: ts });
             drainReadyBroadcasts(ledger);
@@ -242,12 +266,18 @@ function startGenerator(ledger, entry, depth) {
             });
         }
         // 生成器槽位释放，立即尝试启动等待中的 pending
-        drainPendingGenerators(ledger);
+        if (!shuttingDown) drainPendingGenerators(ledger);
     });
 
     child.on('error', (err) => {
-        fs.closeSync(logFd);
+        try { fs.closeSync(logFd); } catch (_) {}
         activeGenerators.delete(entry.id);
+        if (shuttingDown) {
+            updateEntry(ledger, entry.id, 'pending', {
+                generatorPid: null, interruptedAt: new Date().toISOString(), error: null,
+            });
+            return;
+        }
         console.error(`[生成错误] ${entry.id}: ${err.message}`);
         updateEntry(ledger, entry.id, 'failed', {
             generatorFinishedAt: new Date().toISOString(),
@@ -258,6 +288,8 @@ function startGenerator(ledger, entry, depth) {
 }
 
 function drainPendingGenerators(ledger) {
+    if (shuttingDown) return;
+    if (!resourceState.generationAllowed) return;
     while (activeGenerators.size < MAX_GENERATORS) {
         const pending = byStatus(ledger, 'pending');
         if (pending.length === 0) break;
@@ -266,6 +298,8 @@ function drainPendingGenerators(ledger) {
 }
 
 function drainReadyBroadcasts(ledger) {
+    if (shuttingDown) return;
+    if (!resourceState.broadcastAllowed) return;
     const ready = byStatus(ledger, 'generated').filter(e => fs.existsSync(e.txFile));
     if (ready.length === 0) return;
 
@@ -292,6 +326,7 @@ function startBroadcast(ledger, entry) {
         '--rpc-url',  RPC.url,
         '--rpc-user', RPC.auth.username,
         '--rpc-pass', RPC.auth.password,
+        '--dont-check-fee',
     ], {
         stdio: ['ignore', logFd, logFd],
     });
@@ -299,9 +334,16 @@ function startBroadcast(ledger, entry) {
     activeBroadcasts.set(entry.id, { process: child, logFd });
 
     child.on('exit', async (code) => {
-        fs.closeSync(logFd);
+        try { fs.closeSync(logFd); } catch (_) {}
         activeBroadcasts.delete(entry.id);
         const ts              = new Date().toISOString();
+        if (shuttingDown || code === 3) {
+            console.log(`[退出保存] ${entry.id}: broadcasting → generated`);
+            updateEntry(ledger, entry.id, 'generated', {
+                broadcastFinishedAt: ts, interruptedAt: ts, error: null,
+            });
+            return;
+        }
         const success         = code === 0;
         const permanentReject = code === 2;  // 节点明确永久拒绝（low_fee / missing_inputs 全量）
 
@@ -340,8 +382,14 @@ function startBroadcast(ledger, entry) {
     });
 
     child.on('error', async (err) => {
-        fs.closeSync(logFd);
+        try { fs.closeSync(logFd); } catch (_) {}
         activeBroadcasts.delete(entry.id);
+        if (shuttingDown) {
+            updateEntry(ledger, entry.id, 'generated', {
+                interruptedAt: new Date().toISOString(), error: null,
+            });
+            return;
+        }
         const cur     = ledger.entries.find(e => e.id === entry.id);
         const retries = (cur?.broadcastRetries || 0) + 1;
         if (retries >= FLOW_CONFIG.maxBroadcastRetries) {
@@ -379,8 +427,10 @@ let lastHeight = 0;
 recoverStale(ledger);
 
 async function mainLoop() {
+    if (shuttingDown) return;
     const healthy = await checkNodeHealth();
     if (!healthy) { console.log('[警告] 节点RPC不响应'); return; }
+    await refreshResourceState();
 
     let height;
     try { height = await getHeight(); }
@@ -416,10 +466,10 @@ async function mainLoop() {
                 const entry = addEntry(ledger, height, depth, utxo);
                 console.log(`[账本] 新记录: ${entry.id}  depth=${depth}`);
 
-                if (activeGenerators.size < MAX_GENERATORS) {
+                if (resourceState.generationAllowed && activeGenerators.size < MAX_GENERATORS) {
                     startGenerator(ledger, entry, depth);
                 } else {
-                    console.log(`[限流] 生成器已达上限 (${activeGenerators.size}/${MAX_GENERATORS})，${entry.id} 等待 pending`);
+                    console.log(`[限流] ${entry.id} 等待 pending（active=${activeGenerators.size}/${MAX_GENERATORS}${resourceState.reason ? `, ${resourceState.reason}` : ''}）`);
                 }
             }
         }
@@ -445,7 +495,53 @@ async function mainLoop() {
 
     if (STOP_CREATING_NEW && !hasPending && !hasGenerating && !hasGenerated && !hasBroadcasting) {
         console.log('\n[完成] 所有队列已清空（无 pending/generating/generated/broadcasting），程序退出');
-        shutdown('completed');
+        requestShutdown('completed');
+    }
+}
+
+async function refreshResourceState() {
+    const availableMemoryMb = getAvailableMemoryMb();
+    const freeDiskMb = getFreeDiskMb(OUTPUT_BASE_DIR);
+    const backlog = ledger.entries.filter(e => e.status === 'generated' || e.status === 'broadcasting').length;
+    let mempool = null;
+    try { mempool = await rpc('getmempoolinfo', [], FLOW_CONFIG.rpcTimeout); } catch (_) {}
+    const usage = Number(mempool?.usage ?? mempool?.bytes ?? 0);
+    const maximum = Number(mempool?.maxmempool ?? 0);
+    const mempoolRatio = maximum > 0 ? usage / maximum : 0;
+    const reasons = [];
+    if (availableMemoryMb < RESOURCE_LIMITS.minAvailableMemoryMb) reasons.push(`memory ${availableMemoryMb}MB<${RESOURCE_LIMITS.minAvailableMemoryMb}MB`);
+    if (freeDiskMb < RESOURCE_LIMITS.minFreeDiskMb) reasons.push(`disk ${freeDiskMb}MB<${RESOURCE_LIMITS.minFreeDiskMb}MB`);
+    if (backlog >= RESOURCE_LIMITS.maxGeneratedBacklog) reasons.push(`backlog ${backlog}>=${RESOURCE_LIMITS.maxGeneratedBacklog}`);
+    if (mempoolRatio >= RESOURCE_LIMITS.maxMempoolUsageRatio) reasons.push(`mempool ${(mempoolRatio * 100).toFixed(1)}%`);
+    resourceState = {
+        generationAllowed: reasons.length === 0,
+        broadcastAllowed: mempoolRatio < RESOURCE_LIMITS.maxMempoolUsageRatio,
+        reason: reasons.join(', '),
+    };
+    const signature = reasons.length ? `paused:${reasons.join('|')}` : 'healthy';
+    if (signature !== lastResourceMessage) {
+        console.log(reasons.length
+            ? `[资源暂停] ${resourceState.reason}`
+            : `[资源正常] memory=${availableMemoryMb}MB disk=${freeDiskMb}MB mempool=${(mempoolRatio * 100).toFixed(1)}%`);
+        lastResourceMessage = signature;
+    }
+}
+
+function getAvailableMemoryMb() {
+    try {
+        const match = fs.readFileSync('/proc/meminfo', 'utf8').match(/^MemAvailable:\s+(\d+)\s+kB$/m);
+        if (match) return Math.floor(Number(match[1]) / 1024);
+    } catch (_) {}
+    return Number.MAX_SAFE_INTEGER;
+}
+
+function getFreeDiskMb(target) {
+    try {
+        fs.mkdirSync(target, { recursive: true });
+        const stat = fs.statfsSync(target);
+        return Math.floor(Number(stat.bavail) * Number(stat.bsize) / 1024 / 1024);
+    } catch (_) {
+        return Number.MAX_SAFE_INTEGER;
     }
 }
 
@@ -455,22 +551,45 @@ async function mainLoop() {
 console.log('=== 自动压测控制器启动（P2PKH）===');
 console.log(`[流控] 初始 depth=${FLOW_CONFIG.initialDepth}  范围=${FLOW_CONFIG.minDepth}~${FLOW_CONFIG.maxDepth}`);
 
-setInterval(() => mainLoop().catch(e => console.error('[mainLoop]', e.message)), 2000);
+const loopTimer = setInterval(() => mainLoop().catch(e => console.error('[mainLoop]', e.message)), 2000);
 
-process.on('SIGINT',  () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => requestShutdown('SIGINT'));
+process.on('SIGTERM', () => requestShutdown('SIGTERM'));
 
-function shutdown(sig) {
-    console.log(`\n[退出] ${sig}`);
-    for (const [id, { process: p, logFd }] of activeGenerators) {
-        console.log(`  终止 generator ${id}`);
-        p.kill('SIGTERM');
-        try { fs.closeSync(logFd); } catch (_) {}
+function requestShutdown(sig) {
+    if (shutdownPromise) return process.exit(1);
+    shutdownPromise = shutdown(sig).catch(err => {
+        console.error('[退出失败]', err);
+        process.exit(1);
+    });
+}
+
+async function shutdown(sig) {
+    shuttingDown = true;
+    clearInterval(loopTimer);
+    console.log(`\n[退出] ${sig}，停止派发新任务`);
+    const waits = [];
+    for (const [id, { process: p }] of activeGenerators) {
+        console.log(`  停止 generator ${id}（重启后原 seed 重建）`);
+        waits.push(waitForExit(p));
+        try { p.kill('SIGTERM'); } catch (_) {}
     }
-    for (const [id, { process: p, logFd }] of activeBroadcasts) {
-        console.log(`  终止 broadcast ${id}`);
-        p.kill('SIGTERM');
-        try { fs.closeSync(logFd); } catch (_) {}
+    for (const [id, { process: p }] of activeBroadcasts) {
+        console.log(`  暂停 broadcast ${id}（保存 progress.json）`);
+        waits.push(waitForExit(p));
+        try { p.kill('SIGTERM'); } catch (_) {}
     }
+    await Promise.race([Promise.allSettled(waits), delay(SHUTDOWN_TIMEOUT_MS)]);
+    for (const id of activeGenerators.keys()) updateEntry(ledger, id, 'pending', { generatorPid: null, error: null });
+    for (const id of activeBroadcasts.keys()) updateEntry(ledger, id, 'generated', { error: null });
+    saveLedger(ledger);
+    console.log('[退出完成] 状态已保存');
     process.exit(0);
 }
+
+function waitForExit(child) {
+    if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+    return new Promise(resolve => child.once('exit', resolve));
+}
+
+function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }

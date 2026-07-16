@@ -49,6 +49,7 @@ const minimist = require('minimist');
 const argv = minimist(process.argv.slice(2), {
     string: ['config', 'txid', 'outputdir', 'privkey'],
     number: ['vout', 'satoshis', 'depth', 'seed'],
+    boolean: ['reuse-keys'],
     default: {}
 });
 
@@ -108,6 +109,8 @@ if (argv.config) {
         randomSeed: null,
     };
 }
+
+CONFIG.reuseKeys = Boolean(argv['reuse-keys']);
 
 // ==================== 随机数生成器 ====================
 
@@ -421,7 +424,7 @@ class TransactionGraph {
 // ==================== 地址池管理 ====================
 
 class AddressPool {
-    constructor(size, network = 'mainnet') {
+    constructor(size, network = 'mainnet', reuseFile = null) {
         this.keys = [];
         this.addresses = [];
         this.indexMap = new Map();
@@ -430,7 +433,8 @@ class AddressPool {
         this.externalKeys = new Map(); // address -> { key, label, wif }
         this.scriptCache  = new Map(); // address -> scriptHex（预计算，O(1) 查询）
 
-        this.generateKeys(size);
+        if (reuseFile && fs.existsSync(reuseFile)) this.loadKeys(reuseFile, size);
+        else this.generateKeys(size);
     }
 
     importPrivateKey(wif, label = 'external') {
@@ -458,6 +462,24 @@ class AddressPool {
             this.addresses.push(addrStr);
             this.indexMap.set(addrStr, i);
             // 预计算并缓存 P2PKH locking script
+            this.scriptCache.set(addrStr, Script.buildPublicKeyHashOut(address).toHex());
+        }
+    }
+
+    loadKeys(file, count) {
+        const wifs = fs.readFileSync(file, 'utf8').split('\n').map(line => {
+            const match = line.match(/^\[\d+\]\s+\S+\s+\|\s+(\S+)\s*$/);
+            return match?.[1];
+        }).filter(Boolean);
+        if (wifs.length < count) throw new Error(`地址池文件不完整: ${file} (${wifs.length}/${count})`);
+        console.log(`[AddressPool] 复用 ${count} 个已保存私钥: ${file}`);
+        for (const wif of wifs.slice(0, count)) {
+            const privateKey = PrivateKey.fromWIF(wif);
+            const address = privateKey.toAddress();
+            const addrStr = address.toString();
+            this.keys.push(privateKey);
+            this.addresses.push(addrStr);
+            this.indexMap.set(addrStr, this.keys.length - 1);
             this.scriptCache.set(addrStr, Script.buildPublicKeyHashOut(address).toHex());
         }
     }
@@ -490,7 +512,9 @@ class AddressPool {
             content += `[${i}] ${this.addresses[i]} | ${this.keys[i].toWIF()}\n`;
         }
 
-        fs.writeFileSync(outputPath, content);
+        const tmp = `${outputPath}.tmp-${process.pid}`;
+        fs.writeFileSync(tmp, content);
+        fs.renameSync(tmp, outputPath);
         console.log(`[AddressPool] 私钥已保存到: ${outputPath}`);
     }
 }
@@ -559,7 +583,8 @@ class MeshChainBuilder {
         fs.writeFileSync(path.join(this.config.outputDir, 'transactions.txt'), '');
 
         // 初始化地址池
-        this.addressPool = new AddressPool(this.config.addressPoolSize, this.config.network);
+        const keyFile = this.config.reuseKeys ? path.join(this.config.outputDir, 'keys.txt') : null;
+        this.addressPool = new AddressPool(this.config.addressPoolSize, this.config.network, keyFile);
 
         // === 导入初始UTXO的私钥 ===
         console.log('\n[初始化] 导入初始UTXO私钥...');
@@ -931,4 +956,3 @@ main().catch(err => {
     console.error('未捕获的错误:', err);
     process.exit(1);
 });
-

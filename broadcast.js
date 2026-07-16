@@ -124,11 +124,12 @@ function prevalidateAll(txItems, parentLookupItems) {
 // CLI 参数
 const argv = minimist(process.argv.slice(2), {
     string: ['file', 'rpc-url', 'rpc-user', 'rpc-pass'],
-    boolean: ['batch', 'prevalidate'],
+    boolean: ['batch', 'prevalidate', 'dont-check-fee'],
     default: {
         file: './mesh-chain-output/transactions.txt',
         batch: false,
         prevalidate: false,  // 发送前用 tbc-lib-js Interpreter 本地跑每笔 tx 的脚本，剔除已知坏 tx 及其下游
+        'dont-check-fee': false,
         c: 4,  // 单发模式并发数
         p: 2,  // batch 模式层内并行路数（--parallel 或 -p）
     }
@@ -143,6 +144,24 @@ const RPC_CONFIG = {
 const filePath = argv.file;
 const useBatch = argv.batch;
 const prevalidate = argv.prevalidate;
+const dontCheckFee = Boolean(argv['dont-check-fee']);
+let stopRequested = false;
+let stopSignal = null;
+let stopRequestedAt = 0;
+for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.on(signal, () => {
+        if (stopRequested) {
+            // 终端 Ctrl+C 会同时送达父控制器和本子进程，父进程随后还会转发
+            // SIGTERM；忽略这个紧邻的不同信号，避免跳过当前批次的进度落盘。
+            if (signal !== stopSignal && Date.now() - stopRequestedAt < 1000) return;
+            process.exit(3);
+        }
+        stopRequested = true;
+        stopSignal = signal;
+        stopRequestedAt = Date.now();
+        console.log(`\n[退出] 收到 ${signal}，等待当前RPC完成并保存progress.json`);
+    });
+}
 // 单发模式用 -c 并发；batch 模式用 -p/--parallel 控制层内并行路数
 const concurrency = useBatch ? 1 : (parseInt(argv.c) || 4);
 const batchParallelism = parseInt(argv.parallel ?? argv.p) || 2;
@@ -157,7 +176,14 @@ const AUTO_CONFIG = {
 };
 
 // 进度文件路径（与 transactions.txt 同目录）
-const progressFile = filePath.replace('transactions.txt', 'progress.json');
+const progressFile = pathForSibling(filePath, 'progress.json');
+
+function pathForSibling(source, siblingName) {
+    const marker = 'transactions.txt';
+    return source.endsWith(marker)
+        ? source.slice(0, -marker.length) + siblingName
+        : `${source}.${siblingName}`;
+}
 
 // 已成功广播的 txid 集合（跨重播持久化；以 txid 为 key，不受文件行号变化影响）
 let completedTxids = new Set();
@@ -213,11 +239,13 @@ const PROGRESS_ALGO_VERSION = 'tbc-lib-js@hash';
 
 // 保存进度文件
 function saveProgress() {
-    fs.writeFileSync(progressFile, JSON.stringify({
+    const tmp = `${progressFile}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify({
         algoVersion: PROGRESS_ALGO_VERSION,
         completedTxids: Array.from(completedTxids),
         updatedAt: new Date().toISOString()
     }));
+    fs.renameSync(tmp, progressFile);
 }
 
 // 读取交易（过滤已成功的）
@@ -240,7 +268,7 @@ function loadTxs() {
         console.log(`[进度] 跳过 ${skipped} 笔已成功交易，待发送 ${txItems.length} 笔`);
     }
 
-    const graphFile = filePath.replace('transactions.txt', 'graph.json');
+    const graphFile = pathForSibling(filePath, 'graph.json');
 
     // 读取层信息（仅用于统计和验证）
     let layerInfo = null;
@@ -285,6 +313,7 @@ function classifyError(err) {
     if (msg.includes('min relay fee not met'))     return 'low_fee';
     if (msg.includes('fees-too-low'))              return 'low_fee';
     if (msg.includes('fee rate below minimum'))    return 'low_fee';
+    if (msg.includes('mempool min fee not met'))   return 'low_fee';
     if (msg.includes('absurdly-high-fee'))         return 'low_fee';  // 超高费同样固化，不可重试
 
     // ── 永久：脚本 / 签名验证失败 ────────────────────────────────────────────
@@ -311,7 +340,7 @@ async function sendSingle(rawTx) {
             jsonrpc: '1.0',
             id: 'single',
             method: 'sendrawtransaction',
-            params: [rawTx]
+            params: [rawTx, false, dontCheckFee]
         }, {
             auth: {
                 username: RPC_CONFIG.username,
@@ -339,7 +368,7 @@ async function sendBatchBSV(rawTxList) {
             rawTxList.map(tx => ({
                 hex: tx,
                 allowhighfees: false,
-                dontcheckfee: false
+                dontcheckfee: dontCheckFee
             }))
         ]
     };
@@ -372,19 +401,17 @@ function normalizeBatchResult(result, batch) {
     if (Array.isArray(result)) return result;
 
     if (result && typeof result === 'object') {
-        const out = [];
-        if (result.valid) {
-            result.valid.forEach(txid => out.push({ txid, error: null }));
-        }
-        if (result.invalid) {
-            result.invalid.forEach(errObj => {
-                out.push({
-                    txid: errObj.txid || null,
-                    error: errObj.reject_reason || errObj.error || 'unknown'
-                });
-            });
-        }
-        return out;
+        // valid/invalid 是两个分组，不保证仍按请求顺序排列；必须按 txid 回填。
+        const valid = new Set(result.valid || []);
+        const invalid = new Map((result.invalid || []).map(errObj => [
+            errObj.txid,
+            errObj.reject_reason || errObj.error || 'unknown'
+        ]));
+        return batch.map(item => {
+            if (valid.has(item.txid)) return { txid: item.txid, error: null };
+            if (invalid.has(item.txid)) return { txid: item.txid, error: invalid.get(item.txid) };
+            return { txid: item.txid, error: 'unknown_response_format' };
+        });
     }
 
     return batch.map(() => ({ txid: null, error: 'unknown_response_format' }));
@@ -606,6 +633,7 @@ async function broadcastBatchMode(txItems, layerInfo, allItems) {
 
         async function layerWorker() {
             while (true) {
+                if (stopRequested) break;
                 // 原子性取得本 worker 的 chunk 范围（JS 单线程，await 之前不会被中断）
                 const start = layerCursor;
                 if (start >= layerTotal) break;
@@ -617,6 +645,7 @@ async function broadcastBatchMode(txItems, layerInfo, allItems) {
                 let qRetries = 0;
                 while (true) {
                     const { shouldRetry } = await sendBatchAdaptive(chunk);
+                    if (stopRequested) break;
                     if (!shouldRetry) break;
                     if (++qRetries > MAX_QUEUE_RETRIES) {
                         console.log(`\n[中止] work queue 满载重试 ${qRetries} 次仍失败，退出`);
@@ -697,7 +726,9 @@ async function broadcastSingleMode(txItems, layerInfo) {
         const workers = chunks.map(chunk => {
             return (async () => {
                 for (const item of chunk) {
+                    if (stopRequested) break;
                     await sendBatchAdaptive([item]);
+                    if (stopRequested) break;
 
                     // 更新进度
                     const progress = ((state.sent / state.total) * 100).toFixed(1);
@@ -864,6 +895,13 @@ async function broadcast() {
         await broadcastSingleMode(txItems, layerInfo);
     }
 
+    if (stopRequested) {
+        saveProgress();
+        console.log(`[退出保存] signal=${stopSignal} completedTxids=${completedTxids.size}`);
+        process.exitCode = 3;
+        return;
+    }
+
     // 最终结果
     const totalElapsed = (Date.now() - state.startTime) / 1000;
     const avgTps = (state.success / totalElapsed).toFixed(0);
@@ -883,10 +921,11 @@ async function broadcast() {
     // 有失败时：诊断根因，判断是否永久拒绝
     if (state.failed > 0) {
         await diagnoseFailures();
-        // 若全量失败且均为节点明确拒绝类（low_fee / missing_inputs）且无一成功
+        // 若全量失败且均为确定不可通过重播修复的拒绝类且无一成功
         // → 后代 tx 也无法上链，用 exit 2 通知上层不要重试
         // 节点明确拒绝且重播无效的错误类型（重签名才可能改变）
-        const permanentTypes = new Set(['low_fee', 'missing_inputs', 'script_invalid', 'tx_malformed']);
+        // missing_inputs 可能是父交易随 mempool 重启而消失，必须保留为可恢复错误。
+        const permanentTypes = new Set(['low_fee', 'script_invalid', 'tx_malformed']);
         const allPermanent = Object.keys(state.errors).length > 0 &&
                              Object.keys(state.errors).every(k => permanentTypes.has(k));
         if (allPermanent && state.success === 0) {

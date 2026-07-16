@@ -89,7 +89,7 @@ function parseTxOutputs(parsedTx, network = 'mainnet') {
 const argv = minimist(process.argv.slice(2), {
 	string: ['config', 'txid', 'outputdir', 'privkey', 'contracts'],
 	number: ['vout', 'satoshis', 'depth', 'seed', 'showcasedepth'],
-	boolean: ['showcase'],
+	boolean: ['showcase', 'reuse-keys'],
 	default: {},
 });
 
@@ -191,6 +191,7 @@ if (argv.config) {
 if (argv.depth !== undefined) CONFIG.targetMaxDepth = argv.depth;
 if (argv.outputdir) CONFIG.outputDir = argv.outputdir;
 if (argv.seed !== undefined) CONFIG.randomSeed = argv.seed;
+CONFIG.reuseKeys = Boolean(argv['reuse-keys']);
 if (argv.showcasedepth !== undefined) CONFIG.showcaseDepth = argv.showcasedepth;
 
 // ==================== 交易类型定义 ====================
@@ -565,13 +566,14 @@ class TransactionGraph {
 // ==================== 地址池管理 ====================
 
 class AddressPool {
-	constructor(size, network = 'mainnet') {
+	constructor(size, network = 'mainnet', reuseFile = null) {
 		this.keys = [];
 		this.addresses = [];
 		this.indexMap = new Map();
 		this.network = network;
 		this.externalKeys = new Map();
-		this.generateKeys(size);
+		if (reuseFile && fs.existsSync(reuseFile)) this.loadKeys(reuseFile, size);
+		else this.generateKeys(size);
 	}
 
 	importPrivateKey(wif, label = 'external') {
@@ -592,6 +594,22 @@ class AddressPool {
 			this.keys.push(privateKey);
 			this.addresses.push(address.toString());
 			this.indexMap.set(address.toString(), i);
+		}
+	}
+
+	loadKeys(file, count) {
+		const wifs = fs.readFileSync(file, 'utf8').split('\n').map(line => {
+			const match = line.match(/^\[\d+\]\s+\S+\s+\|\s+(\S+)\s*$/);
+			return match?.[1];
+		}).filter(Boolean);
+		if (wifs.length < count) throw new Error(`地址池文件不完整: ${file} (${wifs.length}/${count})`);
+		console.log(`[AddressPool] 复用 ${count} 个已保存私钥: ${file}`);
+		for (const wif of wifs.slice(0, count)) {
+			const privateKey = PrivateKey.fromWIF(wif);
+			const address = privateKey.toAddress().toString();
+			this.keys.push(privateKey);
+			this.addresses.push(address);
+			this.indexMap.set(address, this.keys.length - 1);
 		}
 	}
 
@@ -620,7 +638,9 @@ class AddressPool {
 		for (let i = 0; i < this.keys.length; i++) {
 			content += `[${i}] ${this.addresses[i]} | ${this.keys[i].toWIF()}\n`;
 		}
-		fs.writeFileSync(outputPath, content);
+		const tmp = `${outputPath}.tmp-${process.pid}`;
+		fs.writeFileSync(tmp, content);
+		fs.renameSync(tmp, outputPath);
 	}
 }
 
@@ -1995,7 +2015,8 @@ class AllTypesMeshBuilder {
 		}
 		fs.writeFileSync(path.join(this.config.outputDir, 'transactions.txt'), '');
 
-		this.addressPool = new AddressPool(this.config.addressPoolSize, this.config.network);
+		const keyFile = this.config.reuseKeys ? path.join(this.config.outputDir, 'keys.txt') : null;
+		this.addressPool = new AddressPool(this.config.addressPoolSize, this.config.network, keyFile);
 
 		console.log('\n[初始化] 导入初始UTXO私钥...');
 		for (const utxo of this.config.initialUtxos) {
